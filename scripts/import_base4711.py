@@ -5,7 +5,7 @@
 Importação da Base 4711 para GLPI 10.
 
 Origem:
-  Planilha: Base de dados_4711.xlsx
+  Planilha: Base_dedados_4711.xlsx (na raiz do repositório)
   Aba:      Posto de Trabalho e Fiscais
 
 Regras implementadas:
@@ -38,7 +38,7 @@ Modos:
 
 Exemplo:
   source /root/.glpi.env
-  python3 /root/import_base4711.py --xlsx "/root/Base de dados_4711.xlsx" --dry-run
+  python3 scripts/import_base4711.py --dry-run
 """
 
 import argparse
@@ -48,6 +48,7 @@ import os
 import re
 import sys
 import unicodedata
+from pathlib import Path
 from collections import Counter
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -68,7 +69,7 @@ except ImportError:
 
 
 DEFAULT_API_URL = "https://tec.g4f.sharksolucoes.com.br/apirest.php"
-DEFAULT_XLSX = "/root/Base de dados_4711.xlsx"
+DEFAULT_XLSX = str(Path(__file__).resolve().parents[1] / "Base_dedados_4711.xlsx")
 SHEET_NAME = "Posto de Trabalho e Fiscais"
 
 ROOT_ENTITY_ID = 0
