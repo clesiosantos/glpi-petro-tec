@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Importação da Base 4711 para GLPI 10.
+
+Origem:
+  Planilha: Base de dados_4711.xlsx
+  Aba:      Posto de Trabalho e Fiscais
+
+Regras implementadas:
+- Coluna B (GERENCIA LOTACAO):
+    * cria/garante um Grupo GLPI na entidade G4F
+    * associa o usuário ao grupo
+    * cria/garante o valor no campo dinâmico "Gerencia Lotação"
+- Coluna C (LOCAL):
+    * cria/garante o valor no campo dinâmico "Localização fisica Gerencia"
+- Coluna D (STATUS DA MOBILIZACAO):
+    * cria/garante o valor no campo dinâmico "Status Mobilização"
+- Coluna J (PERFIL PADRÃO):
+    * associa o perfil indicado ao usuário na entidade G4F, recursivo
+    * define esse perfil como padrão do usuário
+- Usuário:
+    * login = primeiro nome normalizado + 4 dígitos pseudoaleatórios estáveis
+    * primeiro nome / último nome são derivados de NOME DO TECNICO
+    * comentário = "ITEM PPU: <valor> :: PREPOSTO: <valor>"
+    * grupo padrão = grupo criado a partir de GERENCIA LOTACAO
+- Linhas cujo NOME DO TECNICO seja "não mobilizar de imediato" são IGNORADAS.
+
+Campos dinâmicos que NÃO serão preenchidos nesta primeira carga:
+- Preposto
+- Chave Colaborador
+- Líder
+
+Modos:
+  --dry-run : valida planilha, API, perfis, container e campos; não grava nada.
+  --apply   : executa a importação.
+
+Exemplo:
+  source /root/.glpi.env
+  python3 /root/import_base4711.py --xlsx "/root/Base de dados_4711.xlsx" --dry-run
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import unicodedata
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
+
+try:
+    from openpyxl import load_workbook
+except ImportError:
+    print(
+        "ERRO: módulo openpyxl não instalado.\n"
+        "Instale antes com:\n"
+        "  dnf -y install python3-openpyxl\n"
+        "ou:\n"
+        "  python3 -m pip install openpyxl",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
+
+DEFAULT_API_URL = "https://tec.g4f.sharksolucoes.com.br/apirest.php"
+DEFAULT_XLSX = "/root/Base de dados_4711.xlsx"
+SHEET_NAME = "Posto de Trabalho e Fiscais"
+
+ROOT_ENTITY_ID = 0
+ADMIN_PROFILE_ID = 4  # ZZ-Super-Admin
+
+CONTAINER_LABEL = "Agrupamento"
+CONTAINER_ITEMTYPE = "User"
+
+FIELD_LABEL_STATUS = "Status Mobilização"
+FIELD_LABEL_GERENCIA = "Gerencia Lotação"
+FIELD_LABEL_LOCAL = "Localização fisica Gerencia"
+
+SKIP_NAMES = {
+    "não mobilizar de imediato",
+    "nao mobilizar de imediato",
+}
+
+GROUP_FLAGS = {
+    "groups_id": 0,
+    "entities_id": ROOT_ENTITY_ID,
+    "is_recursive": 1,
+    "is_requester": 1,
+    "is_watcher": 0,
+    "is_assign": 1,
+    "is_task": 0,
+    "is_notify": 0,
+    "is_manager": 0,
+    "is_itemgroup": 1,
+    "is_usergroup": 1,
+}
+
+
+def load_shell_env_file(path: str = "/root/.glpi.env") -> None:
+    """Carrega arquivo simples no formato export CHAVE='valor'."""
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in ("'", '"')
+            ):
+                value = value[1:-1]
+
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_shell_env_file()
+
+API_URL = os.environ.get("GLPI_API_URL", DEFAULT_API_URL).rstrip("/")
+USER_TOKEN = os.environ.get("GLPI_USER_TOKEN")
+APP_TOKEN = os.environ.get("GLPI_APP_TOKEN")
+
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def normalize_compare(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.casefold().strip()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def ascii_slug(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9]", "", value)
+    return value
+
+
+def excel_code(value: Any) -> str:
+    """Preserva códigos como 1.1, 3.3 e 0 sem transformar 0 em 0.0."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.10f}".rstrip("0").rstrip(".")
+    return clean_text(value)
+
+
+def split_name(full_name: str) -> Tuple[str, str]:
+    parts = re.split(r"\s+", full_name.strip())
+    if not parts:
+        return "", ""
+    firstname = parts[0]
+    realname = " ".join(parts[1:]) if len(parts) > 1 else ""
+    return firstname, realname
+
+
+def stable_login(full_name: str, salt: int = 0) -> str:
+    firstname, _ = split_name(full_name)
+    base = ascii_slug(firstname) or "usuario"
+
+    material = f"{normalize_compare(full_name)}|{salt}".encode("utf-8")
+    digest = hashlib.sha256(material).digest()
+    number = int.from_bytes(digest[:4], "big") % 9000 + 1000
+
+    return f"{base}{number}"
+
+
+def chunked(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
+    chunk: List[Any] = []
+    for item in iterable:
+        chunk.append(item)
+        if len(chunk) >= size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+class GLPI:
+    def __init__(self):
+        if not USER_TOKEN:
+            raise RuntimeError("GLPI_USER_TOKEN não definido.")
+        if not APP_TOKEN:
+            raise RuntimeError("GLPI_APP_TOKEN não definido.")
+
+        self.http = requests.Session()
+        self.http.headers.update(
+            {
+                "App-Token": APP_TOKEN,
+                "Content-Type": "application/json",
+            }
+        )
+        self.session_token: Optional[str] = None
+
+    def init(self) -> None:
+        r = self.http.get(
+            f"{API_URL}/initSession",
+            headers={
+                "Authorization": f"user_token {USER_TOKEN}",
+                "App-Token": APP_TOKEN,
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"initSession: HTTP {r.status_code}: {r.text}"
+            )
+
+        token = r.json().get("session_token")
+        if not token:
+            raise RuntimeError(f"session_token não retornado: {r.text}")
+
+        self.session_token = token
+        self.http.headers["Session-Token"] = token
+
+        r = self.http.post(
+            f"{API_URL}/changeActiveProfile",
+            json={"profiles_id": ADMIN_PROFILE_ID},
+            timeout=30,
+        )
+        if r.status_code != 200 or r.text.strip().lower() != "true":
+            raise RuntimeError(
+                f"changeActiveProfile: HTTP {r.status_code}: {r.text}"
+            )
+
+        r = self.http.post(
+            f"{API_URL}/changeActiveEntities",
+            json={
+                "entities_id": ROOT_ENTITY_ID,
+                "is_recursive": True,
+            },
+            timeout=30,
+        )
+        if r.status_code != 200 or r.text.strip().lower() != "true":
+            raise RuntimeError(
+                f"changeActiveEntities: HTTP {r.status_code}: {r.text}"
+            )
+
+        print("OK - sessão GLPI criada")
+        print("OK - perfil ZZ-Super-Admin ativo")
+        print("OK - entidade G4F ativa recursivamente")
+
+    def close(self) -> None:
+        if not self.session_token:
+            return
+        try:
+            self.http.get(f"{API_URL}/killSession", timeout=15)
+        except Exception:
+            pass
+
+    def get_all(
+        self,
+        itemtype: str,
+        *,
+        page_size: int = 200,
+        allow_missing: bool = False,
+    ) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        start = 0
+
+        while True:
+            end = start + page_size - 1
+            r = self.http.get(
+                f"{API_URL}/{itemtype}/",
+                params={
+                    "range": f"{start}-{end}",
+                    "get_hateoas": "false",
+                },
+                timeout=60,
+            )
+
+            if allow_missing and r.status_code in (400, 404):
+                return []
+
+            if r.status_code not in (200, 206):
+                raise RuntimeError(
+                    f"GET {itemtype}: HTTP {r.status_code}: {r.text}"
+                )
+
+            data = r.json()
+            if not isinstance(data, list):
+                raise RuntimeError(
+                    f"Resposta inesperada em {itemtype}: {data}"
+                )
+
+            result.extend(data)
+
+            if len(data) < page_size:
+                break
+            start += page_size
+
+        return result
+
+    def add(self, itemtype: str, payload: Dict[str, Any]) -> int:
+        r = self.http.post(
+            f"{API_URL}/{itemtype}/",
+            json={"input": payload},
+            timeout=60,
+        )
+
+        if r.status_code not in (200, 201):
+            raise RuntimeError(
+                f"POST {itemtype}: HTTP {r.status_code}: {r.text}\n"
+                f"Payload: {json.dumps(payload, ensure_ascii=False)}"
+            )
+
+        data = r.json()
+        if isinstance(data, dict) and data.get("id") is not None:
+            return int(data["id"])
+
+        if isinstance(data, list) and data and data[0].get("id") is not None:
+            return int(data[0]["id"])
+
+        raise RuntimeError(
+            f"POST {itemtype}: ID não retornado. Resposta: {data}"
+        )
+
+    def update(
+        self,
+        itemtype: str,
+        item_id: int,
+        payload: Dict[str, Any],
+    ) -> None:
+        body = dict(payload)
+        body["id"] = int(item_id)
+
+        r = self.http.put(
+            f"{API_URL}/{itemtype}/{item_id}",
+            json={"input": body},
+            timeout=60,
+        )
+
+        if r.status_code not in (200, 201):
+            raise RuntimeError(
+                f"PUT {itemtype}/{item_id}: "
+                f"HTTP {r.status_code}: {r.text}\n"
+                f"Payload: {json.dumps(body, ensure_ascii=False)}"
+            )
+
+
+def read_rows(xlsx_path: str) -> Tuple[List[Dict[str, str]], List[int]]:
+    if not os.path.exists(xlsx_path):
+        raise RuntimeError(f"Planilha não encontrada: {xlsx_path}")
+
+    book = load_workbook(xlsx_path, read_only=True, data_only=True)
+
+    if SHEET_NAME not in book.sheetnames:
+        raise RuntimeError(
+            f"Aba '{SHEET_NAME}' não encontrada. "
+            f"Abas disponíveis: {book.sheetnames}"
+        )
+
+    ws = book[SHEET_NAME]
+
+    headers = [clean_text(cell.value) for cell in ws[1]]
+
+    required = [
+        "NOME DO TECNICO",
+        "GERENCIA LOTACAO",
+        "LOCAL",
+        "STATUS DA MOBILIZACAO",
+        "PREPOSTO",
+        "ITEM PPU",
+        "PERFIL PADRÃO",
+    ]
+
+    index = {h: i for i, h in enumerate(headers)}
+
+    missing = [name for name in required if name not in index]
+    if missing:
+        raise RuntimeError(
+            f"Colunas obrigatórias ausentes: {', '.join(missing)}"
+        )
+
+    rows: List[Dict[str, str]] = []
+    skipped: List[int] = []
+
+    for excel_row, values in enumerate(
+        ws.iter_rows(min_row=2, values_only=True),
+        start=2,
+    ):
+        name = clean_text(values[index["NOME DO TECNICO"]])
+
+        if not name:
+            continue
+
+        if normalize_compare(name) in {
+            normalize_compare(x) for x in SKIP_NAMES
+        }:
+            skipped.append(excel_row)
+            continue
+
+        row = {
+            "excel_row": str(excel_row),
+            "full_name": name,
+            "gerencia": clean_text(
+                values[index["GERENCIA LOTACAO"]]
+            ),
+            "local": clean_text(
+                values[index["LOCAL"]]
+            ),
+            "status": clean_text(
+                values[index["STATUS DA MOBILIZACAO"]]
+            ),
+            "preposto": clean_text(
+                values[index["PREPOSTO"]]
+            ),
+            "ppu": excel_code(
+                values[index["ITEM PPU"]]
+            ),
+            "profile": clean_text(
+                values[index["PERFIL PADRÃO"]]
+            ),
+        }
+
+        for key in ("gerencia", "local", "status", "profile"):
+            if not row[key]:
+                raise RuntimeError(
+                    f"Linha {excel_row}: campo obrigatório vazio: {key}"
+                )
+
+        rows.append(row)
+
+    book.close()
+
+    return rows, skipped
+
+
+def find_container_and_fields(
+    glpi: GLPI,
+) -> Tuple[
+    Dict[str, Any],
+    Dict[str, Dict[str, Any]],
+]:
+    containers = glpi.get_all("PluginFieldsContainer")
+    fields = glpi.get_all("PluginFieldsField")
+
+    target_container: Optional[Dict[str, Any]] = None
+
+    for c in containers:
+        label = clean_text(c.get("label"))
+        itemtypes = c.get("itemtypes")
+
+        try:
+            if isinstance(itemtypes, str):
+                parsed = json.loads(itemtypes)
+            elif isinstance(itemtypes, list):
+                parsed = itemtypes
+            else:
+                parsed = []
+        except Exception:
+            parsed = []
+
+        if (
+            normalize_compare(label)
+            == normalize_compare(CONTAINER_LABEL)
+            and CONTAINER_ITEMTYPE in parsed
+        ):
+            target_container = c
+            break
+
+    if not target_container:
+        raise RuntimeError(
+            f"Container '{CONTAINER_LABEL}' para User não localizado."
+        )
+
+    container_id = int(target_container["id"])
+
+    selected: Dict[str, Dict[str, Any]] = {}
+
+    wanted = {
+        normalize_compare(FIELD_LABEL_STATUS): "status",
+        normalize_compare(FIELD_LABEL_GERENCIA): "gerencia",
+        normalize_compare(FIELD_LABEL_LOCAL): "local",
+    }
+
+    for field in fields:
+        if int(field.get("plugin_fields_containers_id") or 0) != container_id:
+            continue
+
+        label_norm = normalize_compare(clean_text(field.get("label")))
+        key = wanted.get(label_norm)
+
+        if key:
+            selected[key] = field
+
+    missing = [
+        label
+        for key, label in [
+            ("status", FIELD_LABEL_STATUS),
+            ("gerencia", FIELD_LABEL_GERENCIA),
+            ("local", FIELD_LABEL_LOCAL),
+        ]
+        if key not in selected
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Campos dinâmicos não localizados no container "
+            f"'{CONTAINER_LABEL}': {', '.join(missing)}"
+        )
+
+    for key, field in selected.items():
+        if clean_text(field.get("type")) != "dropdown":
+            raise RuntimeError(
+                f"Campo '{field.get('label')}' não é do tipo dropdown. "
+                f"Tipo encontrado: {field.get('type')}"
+            )
+
+    return target_container, selected
+
+
+def dropdown_itemtype(field_internal_name: str) -> str:
+    if not field_internal_name:
+        raise RuntimeError("Nome interno de campo vazio.")
+    return (
+        "PluginFields"
+        + field_internal_name[0].upper()
+        + field_internal_name[1:]
+        + "Dropdown"
+    )
+
+
+def container_instance_itemtype(container_name: str) -> str:
+    # PluginFieldsContainer::getClassname('User', <container_name>)
+    name = re.sub(r"s$", "", container_name, flags=re.IGNORECASE)
+    system_name = ("User" + name).lower()
+    return "PluginFields" + system_name[0].upper() + system_name[1:]
+
+
+def build_existing_user_maps(
+    users: List[Dict[str, Any]],
+) -> Tuple[
+    Dict[str, Dict[str, Any]],
+    Dict[str, List[Dict[str, Any]]],
+]:
+    by_login: Dict[str, Dict[str, Any]] = {}
+    by_fullname: Dict[str, List[Dict[str, Any]]] = {}
+
+    for u in users:
+        login = normalize_compare(clean_text(u.get("name")))
+        if login:
+            by_login[login] = u
+
+        firstname = clean_text(u.get("firstname"))
+        realname = clean_text(u.get("realname"))
+        fullname = normalize_compare(
+            " ".join(x for x in [firstname, realname] if x)
+        )
+
+        if fullname:
+            by_fullname.setdefault(fullname, []).append(u)
+
+    return by_login, by_fullname
+
+
+def choose_login(
+    full_name: str,
+    users_by_login: Dict[str, Dict[str, Any]],
+) -> str:
+    for salt in range(100):
+        login = stable_login(full_name, salt)
+        if normalize_compare(login) not in users_by_login:
+            return login
+    raise RuntimeError(
+        f"Não foi possível gerar login livre para: {full_name}"
+    )
+
+
+def get_profiles_by_name(
+    profiles: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    result: Dict[str, int] = {}
+    for p in profiles:
+        name = clean_text(p.get("name"))
+        if name:
+            result[normalize_compare(name)] = int(p["id"])
+    return result
+
+
+def map_existing_groups(
+    groups: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for g in groups:
+        if int(g.get("entities_id") or 0) != ROOT_ENTITY_ID:
+            continue
+        name = clean_text(g.get("name"))
+        if name:
+            result[normalize_compare(name)] = g
+    return result
+
+
+def map_dropdown(
+    rows: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        name = clean_text(row.get("name"))
+        if name:
+            result[normalize_compare(name)] = row
+    return result
+
+
+def ensure_dropdown_value(
+    glpi: GLPI,
+    itemtype: str,
+    existing_map: Dict[str, Dict[str, Any]],
+    name: str,
+) -> int:
+    key = normalize_compare(name)
+
+    if key in existing_map:
+        return int(existing_map[key]["id"])
+
+    item_id = glpi.add(
+        itemtype,
+        {
+            "name": name,
+            "entities_id": ROOT_ENTITY_ID,
+            "is_recursive": 1,
+        },
+    )
+
+    existing_map[key] = {
+        "id": item_id,
+        "name": name,
+        "entities_id": ROOT_ENTITY_ID,
+        "is_recursive": 1,
+    }
+
+    print(f"CRIADO dropdown {itemtype}: ID={item_id} {name}")
+    return item_id
+
+
+def ensure_group(
+    glpi: GLPI,
+    groups_map: Dict[str, Dict[str, Any]],
+    group_name: str,
+) -> int:
+    key = normalize_compare(group_name)
+
+    if key in groups_map:
+        return int(groups_map[key]["id"])
+
+    payload = dict(GROUP_FLAGS)
+    payload["name"] = group_name
+    payload["comment"] = "Importação Base 4711"
+
+    group_id = glpi.add("Group", payload)
+
+    groups_map[key] = {
+        "id": group_id,
+        **payload,
+    }
+
+    print(f"CRIADO grupo: ID={group_id} {group_name}")
+    return group_id
+
+
+def ensure_profile_user(
+    glpi: GLPI,
+    existing: set,
+    user_id: int,
+    profile_id: int,
+) -> None:
+    key = (user_id, profile_id, ROOT_ENTITY_ID, 1)
+
+    if key in existing:
+        return
+
+    glpi.add(
+        "Profile_User",
+        {
+            "users_id": user_id,
+            "profiles_id": profile_id,
+            "entities_id": ROOT_ENTITY_ID,
+            "is_recursive": 1,
+            "is_dynamic": 0,
+        },
+    )
+
+    existing.add(key)
+
+
+def ensure_group_user(
+    glpi: GLPI,
+    existing: set,
+    user_id: int,
+    group_id: int,
+) -> None:
+    key = (user_id, group_id)
+
+    if key in existing:
+        return
+
+    glpi.add(
+        "Group_User",
+        {
+            "users_id": user_id,
+            "groups_id": group_id,
+            "is_dynamic": 0,
+        },
+    )
+
+    existing.add(key)
+
+
+def dry_run_report(
+    rows: List[Dict[str, str]],
+    skipped: List[int],
+    profiles_by_name: Dict[str, int],
+    groups_map: Dict[str, Dict[str, Any]],
+    users: List[Dict[str, Any]],
+    dropdown_maps: Dict[str, Dict[str, Dict[str, Any]]],
+    container: Dict[str, Any],
+    fields: Dict[str, Dict[str, Any]],
+    instance_itemtype: str,
+    instance_api_rows: List[Dict[str, Any]],
+) -> None:
+    gerencias = sorted({r["gerencia"] for r in rows})
+    locais = sorted({r["local"] for r in rows})
+    statuses = sorted({r["status"] for r in rows})
+    profiles = sorted({r["profile"] for r in rows})
+
+    users_by_login, users_by_fullname = build_existing_user_maps(users)
+
+    existing_user_count = 0
+    new_user_count = 0
+    generated_logins: List[Tuple[str, str]] = []
+
+    temp_logins = dict(users_by_login)
+
+    for row in rows:
+        fullname_key = normalize_compare(row["full_name"])
+        matches = users_by_fullname.get(fullname_key, [])
+
+        if len(matches) == 1:
+            existing_user_count += 1
+            continue
+
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Mais de um usuário existente com o nome "
+                f"'{row['full_name']}'."
+            )
+
+        login = choose_login(row["full_name"], temp_logins)
+        temp_logins[normalize_compare(login)] = {
+            "name": login,
+        }
+        generated_logins.append((row["full_name"], login))
+        new_user_count += 1
+
+    print()
+    print("=" * 96)
+    print("ANÁLISE DA PLANILHA")
+    print("=" * 96)
+    print(f"Linhas válidas para importação........: {len(rows)}")
+    print(f"Linhas ignoradas......................: {len(skipped)}")
+    print(f"Grupos / Gerências únicas............: {len(gerencias)}")
+    print(f"Locais únicos.........................: {len(locais)}")
+    print(f"Status únicos.........................: {len(statuses)}")
+    print(f"Usuários já existentes pelo nome.....: {existing_user_count}")
+    print(f"Usuários que seriam criados..........: {new_user_count}")
+    print()
+
+    print("Perfis usados na planilha:")
+    for profile in profiles:
+        pid = profiles_by_name.get(normalize_compare(profile))
+        print(f"  - {profile}: ID {pid}")
+
+    print()
+    print("Grupos / Gerencia Lotação:")
+    for name in gerencias:
+        exists = normalize_compare(name) in groups_map
+        dd_exists = (
+            normalize_compare(name)
+            in dropdown_maps["gerencia"]
+        )
+        print(
+            f"  - {name} | grupo={'EXISTE' if exists else 'CRIAR'} "
+            f"| dropdown={'EXISTE' if dd_exists else 'CRIAR'}"
+        )
+
+    print()
+    print("Localização fisica Gerencia:")
+    for name in locais:
+        exists = normalize_compare(name) in dropdown_maps["local"]
+        print(f"  - {name}: {'EXISTE' if exists else 'CRIAR'}")
+
+    print()
+    print("Status Mobilização:")
+    for name in statuses:
+        exists = normalize_compare(name) in dropdown_maps["status"]
+        print(f"  - {name}: {'EXISTE' if exists else 'CRIAR'}")
+
+    print()
+    print("Container Fields:")
+    print(
+        f"  Container: {container.get('label')} "
+        f"(ID {container.get('id')}, name={container.get('name')})"
+    )
+    for key in ("status", "gerencia", "local"):
+        f = fields[key]
+        print(
+            f"  {key}: label='{f.get('label')}' "
+            f"name='{f.get('name')}' type='{f.get('type')}'"
+        )
+
+    print()
+    print(
+        f"Itemtype de armazenamento do container: "
+        f"{instance_itemtype}"
+    )
+    print(
+        f"Registros atuais acessíveis via API nesse itemtype: "
+        f"{len(instance_api_rows)}"
+    )
+
+    print()
+    print("Amostra dos logins que seriam criados:")
+    for full_name, login in generated_logins[:15]:
+        print(f"  {full_name} -> {login}")
+
+    if len(generated_logins) > 15:
+        print(
+            f"  ... mais {len(generated_logins) - 15} usuário(s)"
+        )
+
+    print()
+    print("Comentários dos usuários:")
+    print(
+        "  ITEM PPU: <coluna G> :: PREPOSTO: <coluna E>"
+    )
+
+    print()
+    print("Campos NÃO preenchidos nesta etapa:")
+    print("  - Preposto (campo dinâmico)")
+    print("  - Chave Colaborador")
+    print("  - Líder")
+
+    print()
+    print("Linhas ignoradas por 'não mobilizar de imediato':")
+    print("  " + ", ".join(str(x) for x in skipped) if skipped else "  nenhuma")
+
+    print("=" * 96)
+    print("DRY-RUN concluído. Nenhuma alteração foi realizada.")
+    print("=" * 96)
+
+
+def run_apply(
+    glpi: GLPI,
+    rows: List[Dict[str, str]],
+    profiles_by_name: Dict[str, int],
+    groups_map: Dict[str, Dict[str, Any]],
+    users: List[Dict[str, Any]],
+    profile_users: List[Dict[str, Any]],
+    group_users: List[Dict[str, Any]],
+    container: Dict[str, Any],
+    fields: Dict[str, Dict[str, Any]],
+    dropdown_itemtypes: Dict[str, str],
+    dropdown_maps: Dict[str, Dict[str, Dict[str, Any]]],
+    instance_itemtype: str,
+    instance_rows: List[Dict[str, Any]],
+) -> None:
+    users_by_login, users_by_fullname = build_existing_user_maps(users)
+
+    profile_user_existing = {
+        (
+            int(x.get("users_id") or 0),
+            int(x.get("profiles_id") or 0),
+            int(x.get("entities_id") or 0),
+            int(x.get("is_recursive") or 0),
+        )
+        for x in profile_users
+    }
+
+    group_user_existing = {
+        (
+            int(x.get("users_id") or 0),
+            int(x.get("groups_id") or 0),
+        )
+        for x in group_users
+    }
+
+    instance_by_user_id = {
+        int(x.get("items_id") or 0): x
+        for x in instance_rows
+        if int(x.get("items_id") or 0) > 0
+    }
+
+    gerencias = sorted({r["gerencia"] for r in rows})
+    locais = sorted({r["local"] for r in rows})
+    statuses = sorted({r["status"] for r in rows})
+
+    group_ids: Dict[str, int] = {}
+    for name in gerencias:
+        group_ids[name] = ensure_group(
+            glpi,
+            groups_map,
+            name,
+        )
+
+    dropdown_ids: Dict[str, Dict[str, int]] = {
+        "gerencia": {},
+        "local": {},
+        "status": {},
+    }
+
+    for name in gerencias:
+        dropdown_ids["gerencia"][name] = ensure_dropdown_value(
+            glpi,
+            dropdown_itemtypes["gerencia"],
+            dropdown_maps["gerencia"],
+            name,
+        )
+
+    for name in locais:
+        dropdown_ids["local"][name] = ensure_dropdown_value(
+            glpi,
+            dropdown_itemtypes["local"],
+            dropdown_maps["local"],
+            name,
+        )
+
+    for name in statuses:
+        dropdown_ids["status"][name] = ensure_dropdown_value(
+            glpi,
+            dropdown_itemtypes["status"],
+            dropdown_maps["status"],
+            name,
+        )
+
+    field_names = {
+        key: clean_text(field["name"])
+        for key, field in fields.items()
+    }
+
+    col_status = (
+        f"plugin_fields_{field_names['status']}dropdowns_id"
+    )
+    col_gerencia = (
+        f"plugin_fields_{field_names['gerencia']}dropdowns_id"
+    )
+    col_local = (
+        f"plugin_fields_{field_names['local']}dropdowns_id"
+    )
+
+    container_id = int(container["id"])
+
+    created_users = 0
+    reused_users = 0
+    updated_fields = 0
+
+    for pos, row in enumerate(rows, start=1):
+        full_name = row["full_name"]
+        firstname, realname = split_name(full_name)
+        fullname_key = normalize_compare(full_name)
+
+        matches = users_by_fullname.get(fullname_key, [])
+
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Mais de um usuário existente para '{full_name}'."
+            )
+
+        if len(matches) == 1:
+            user = matches[0]
