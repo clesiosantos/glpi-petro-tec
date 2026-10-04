@@ -999,3 +999,313 @@ def run_apply(
 
         if len(matches) == 1:
             user = matches[0]
+            user_id = int(user["id"])
+            login = clean_text(user.get("name"))
+            reused_users += 1
+        else:
+            login = choose_login(full_name, users_by_login)
+
+            comment = (
+                f"ITEM PPU: {row['ppu']} :: "
+                f"PREPOSTO: {row['preposto']}"
+            )
+
+            user_id = glpi.add(
+                "User",
+                {
+                    "name": login,
+                    "firstname": firstname,
+                    "realname": realname,
+                    "is_active": 1,
+                    "comment": comment,
+                },
+            )
+
+            user = {
+                "id": user_id,
+                "name": login,
+                "firstname": firstname,
+                "realname": realname,
+            }
+
+            users_by_login[normalize_compare(login)] = user
+            users_by_fullname.setdefault(
+                fullname_key,
+                [],
+            ).append(user)
+
+            created_users += 1
+            print(
+                f"CRIADO usuário ID={user_id}: "
+                f"{full_name} -> {login}"
+            )
+
+        profile_id = profiles_by_name[
+            normalize_compare(row["profile"])
+        ]
+        group_id = group_ids[row["gerencia"]]
+
+        ensure_profile_user(
+            glpi,
+            profile_user_existing,
+            user_id,
+            profile_id,
+        )
+        ensure_group_user(
+            glpi,
+            group_user_existing,
+            user_id,
+            group_id,
+        )
+
+        comment = (
+            f"ITEM PPU: {row['ppu']} :: "
+            f"PREPOSTO: {row['preposto']}"
+        )
+
+        # Depois das associações, define perfil, entidade e grupo padrão.
+        glpi.update(
+            "User",
+            user_id,
+            {
+                "firstname": firstname,
+                "realname": realname,
+                "is_active": 1,
+                "comment": comment,
+                "profiles_id": profile_id,
+                "entities_id": ROOT_ENTITY_ID,
+                "groups_id": group_id,
+            },
+        )
+
+        plugin_payload = {
+            "items_id": user_id,
+            "itemtype": "User",
+            "plugin_fields_containers_id": container_id,
+            col_status: dropdown_ids["status"][row["status"]],
+            col_gerencia: dropdown_ids["gerencia"][row["gerencia"]],
+            col_local: dropdown_ids["local"][row["local"]],
+        }
+
+        existing_instance = instance_by_user_id.get(user_id)
+
+        if existing_instance:
+            instance_id = int(existing_instance["id"])
+            glpi.update(
+                instance_itemtype,
+                instance_id,
+                plugin_payload,
+            )
+        else:
+            instance_id = glpi.add(
+                instance_itemtype,
+                plugin_payload,
+            )
+            instance_by_user_id[user_id] = {
+                "id": instance_id,
+                **plugin_payload,
+            }
+
+        updated_fields += 1
+
+        print(
+            f"[{pos:03}/{len(rows)}] OK "
+            f"ID={user_id} login={login} "
+            f"grupo='{row['gerencia']}' "
+            f"local='{row['local']}' "
+            f"status='{row['status']}' "
+            f"perfil='{row['profile']}'"
+        )
+
+    print()
+    print("=" * 96)
+    print("IMPORTAÇÃO CONCLUÍDA")
+    print("=" * 96)
+    print(f"Usuários criados.....................: {created_users}")
+    print(f"Usuários reaproveitados..............: {reused_users}")
+    print(f"Usuários com campos dinâmicos gravados: {updated_fields}")
+    print(f"Grupos processados...................: {len(group_ids)}")
+    print(f"Gerências dropdown...................: {len(dropdown_ids['gerencia'])}")
+    print(f"Locais dropdown......................: {len(dropdown_ids['local'])}")
+    print(f"Status dropdown......................: {len(dropdown_ids['status'])}")
+    print("=" * 96)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Importa Base 4711 no GLPI."
+    )
+
+    parser.add_argument(
+        "--xlsx",
+        default=DEFAULT_XLSX,
+        help=f"Caminho do XLSX. Padrão: {DEFAULT_XLSX}",
+    )
+
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Somente valida e apresenta o plano.",
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Executa a importação.",
+    )
+
+    args = parser.parse_args()
+
+    rows, skipped = read_rows(args.xlsx)
+
+    print(f"OK - planilha lida: {args.xlsx}")
+    print(f"OK - {len(rows)} linha(s) válida(s)")
+    print(f"OK - {len(skipped)} linha(s) ignorada(s)")
+
+    if len(rows) != 120:
+        print(
+            f"ATENÇÃO: esperávamos 120 linhas válidas, "
+            f"mas foram encontradas {len(rows)}."
+        )
+
+    glpi = GLPI()
+
+    try:
+        glpi.init()
+
+        profiles = glpi.get_all("Profile")
+        profiles_by_name = get_profiles_by_name(profiles)
+
+        required_profiles = sorted({r["profile"] for r in rows})
+
+        missing_profiles = [
+            p
+            for p in required_profiles
+            if normalize_compare(p) not in profiles_by_name
+        ]
+
+        if missing_profiles:
+            raise RuntimeError(
+                "Perfis da planilha não encontrados no GLPI: "
+                + ", ".join(missing_profiles)
+            )
+
+        print(
+            "OK - perfis localizados: "
+            + ", ".join(
+                f"{p}=ID {profiles_by_name[normalize_compare(p)]}"
+                for p in required_profiles
+            )
+        )
+
+        container, fields = find_container_and_fields(glpi)
+
+        print(
+            f"OK - container '{container.get('label')}' "
+            f"ID={container.get('id')}"
+        )
+
+        dropdown_itemtypes = {
+            key: dropdown_itemtype(clean_text(field["name"]))
+            for key, field in fields.items()
+        }
+
+        dropdown_maps: Dict[
+            str,
+            Dict[str, Dict[str, Any]],
+        ] = {}
+
+        for key, itemtype in dropdown_itemtypes.items():
+            rows_dd = glpi.get_all(itemtype)
+            dropdown_maps[key] = map_dropdown(rows_dd)
+            print(
+                f"OK - {itemtype}: "
+                f"{len(rows_dd)} valor(es) existente(s)"
+            )
+
+        container_name = clean_text(container.get("name"))
+        instance_itemtype = container_instance_itemtype(
+            container_name
+        )
+
+        # Este teste é importante no GLPI 10:
+        # verifica se o itemtype gerado pelo Fields está exposto
+        # na Legacy REST API.
+        instance_rows = glpi.get_all(
+            instance_itemtype,
+            allow_missing=True,
+        )
+
+        # Se retornou vazio pode ser tabela realmente vazia.
+        # Verificamos o endpoint diretamente para diferenciar 404/400.
+        endpoint_test = glpi.http.get(
+            f"{API_URL}/{instance_itemtype}/",
+            params={"range": "0-0", "get_hateoas": "false"},
+            timeout=30,
+        )
+
+        if endpoint_test.status_code not in (200, 206):
+            raise RuntimeError(
+                f"O itemtype gerado '{instance_itemtype}' não está "
+                f"acessível pela API (HTTP {endpoint_test.status_code}). "
+                "Neste ambiente GLPI 10 será necessário usar o bridge "
+                "PHP/local para gravar os campos do plugin Fields."
+            )
+
+        groups = glpi.get_all("Group")
+        groups_map = map_existing_groups(groups)
+
+        users = glpi.get_all("User")
+
+        if args.dry_run:
+            dry_run_report(
+                rows,
+                skipped,
+                profiles_by_name,
+                groups_map,
+                users,
+                dropdown_maps,
+                container,
+                fields,
+                instance_itemtype,
+                instance_rows,
+            )
+            return 0
+
+        profile_users = glpi.get_all("Profile_User")
+        group_users = glpi.get_all("Group_User")
+
+        run_apply(
+            glpi,
+            rows,
+            profiles_by_name,
+            groups_map,
+            users,
+            profile_users,
+            group_users,
+            container,
+            fields,
+            dropdown_itemtypes,
+            dropdown_maps,
+            instance_itemtype,
+            instance_rows,
+        )
+
+        return 0
+
+    finally:
+        glpi.close()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\nExecução interrompida.", file=sys.stderr)
+        sys.exit(130)
+    except requests.RequestException as exc:
+        print(f"\nERRO HTTP: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except Exception as exc:
+        print(f"\nERRO: {exc}", file=sys.stderr)
+        sys.exit(1)
