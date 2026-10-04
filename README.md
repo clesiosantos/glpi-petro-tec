@@ -4,7 +4,7 @@ Projeto de implantação e automação do ambiente GLPI da operação Petrobras/
 
 ## Script de importação da Base 4711
 
-O arquivo `scripts/import_base4711.py` automatiza a carga da planilha **Base de dados_4711.xlsx** para o GLPI 10.
+O arquivo `scripts/import_base4711.py` automatiza a carga da planilha **Base_dedados_4711.xlsx**, armazenada na raiz deste repositório, para o GLPI 10.
 
 Principais regras implementadas:
 
@@ -39,9 +39,7 @@ export GLPI_APP_TOKEN='...'
 ```bash
 source /root/.glpi.env
 
-python3 scripts/import_base4711.py \
-  --xlsx "/root/Base de dados_4711.xlsx" \
-  --dry-run
+python3 scripts/import_base4711.py --dry-run
 ```
 
 ## Implantação
@@ -49,9 +47,7 @@ python3 scripts/import_base4711.py \
 Somente após validar o `--dry-run`:
 
 ```bash
-python3 scripts/import_base4711.py \
-  --xlsx "/root/Base de dados_4711.xlsx" \
-  --apply
+python3 scripts/import_base4711.py --apply
 ```
 
 > Não versionar tokens, arquivos `.env` ou planilhas contendo dados pessoais.
