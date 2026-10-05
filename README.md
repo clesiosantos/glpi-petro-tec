@@ -51,3 +51,14 @@ python3 scripts/import_base4711.py --apply
 ```
 
 > Não versionar tokens, arquivos `.env` ou planilhas contendo dados pessoais.
+
+
+## Senha inicial dos usuários
+
+A senha padrão não é versionada no repositório. Defina-a localmente em `/root/.glpi.env`:
+
+```bash
+export GLPI_DEFAULT_PASSWORD='SENHA_PADRAO_AQUI'
+```
+
+O importador envia `password` e `password2` ao GLPI durante a criação dos usuários. O valor não é exibido nos logs.
