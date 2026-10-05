@@ -797,6 +797,7 @@ def dry_run_report(
     print(f"Status únicos.........................: {len(statuses)}")
     print(f"Usuários já existentes pelo nome.....: {existing_user_count}")
     print(f"Usuários que seriam criados..........: {new_user_count}")
+    print(f"Usuários que terão senha atualizada..: {existing_user_count}")
     print(
         "Senha padrão..........................: "
         + ("CONFIGURADA" if DEFAULT_PASSWORD else "NÃO CONFIGURADA")
@@ -1072,18 +1073,26 @@ def run_apply(
         )
 
         # Depois das associações, define perfil, entidade e grupo padrão.
+        # Para usuários que já existiam antes desta execução, redefine também
+        # a senha para a senha inicial padrão configurada em GLPI_DEFAULT_PASSWORD.
+        user_update = {
+            "firstname": firstname,
+            "realname": realname,
+            "is_active": 1,
+            "comment": comment,
+            "profiles_id": profile_id,
+            "entities_id": ROOT_ENTITY_ID,
+            "groups_id": group_id,
+        }
+
+        if len(matches) == 1:
+            user_update["password"] = DEFAULT_PASSWORD
+            user_update["password2"] = DEFAULT_PASSWORD
+
         glpi.update(
             "User",
             user_id,
-            {
-                "firstname": firstname,
-                "realname": realname,
-                "is_active": 1,
-                "comment": comment,
-                "profiles_id": profile_id,
-                "entities_id": ROOT_ENTITY_ID,
-                "groups_id": group_id,
-            },
+            user_update,
         )
 
         plugin_payload = {
