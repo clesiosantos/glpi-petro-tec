@@ -25,6 +25,7 @@ Regras implementadas:
     * primeiro nome / último nome são derivados de NOME DO TECNICO
     * comentário = "ITEM PPU: <valor> :: PREPOSTO: <valor>"
     * grupo padrão = grupo criado a partir de GERENCIA LOTACAO
+    * senha inicial padrão = variável GLPI_DEFAULT_PASSWORD
 - Linhas cujo NOME DO TECNICO seja "não mobilizar de imediato" são IGNORADAS.
 
 Campos dinâmicos que NÃO serão preenchidos nesta primeira carga:
@@ -137,6 +138,7 @@ load_shell_env_file()
 API_URL = os.environ.get("GLPI_API_URL", DEFAULT_API_URL).rstrip("/")
 USER_TOKEN = os.environ.get("GLPI_USER_TOKEN")
 APP_TOKEN = os.environ.get("GLPI_APP_TOKEN")
+DEFAULT_PASSWORD = os.environ.get("GLPI_DEFAULT_PASSWORD")
 
 
 def clean_text(value: Any) -> str:
@@ -795,6 +797,10 @@ def dry_run_report(
     print(f"Status únicos.........................: {len(statuses)}")
     print(f"Usuários já existentes pelo nome.....: {existing_user_count}")
     print(f"Usuários que seriam criados..........: {new_user_count}")
+    print(
+        "Senha padrão..........................: "
+        + ("CONFIGURADA" if DEFAULT_PASSWORD else "NÃO CONFIGURADA")
+    )
     print()
 
     print("Perfis usados na planilha:")
@@ -1018,6 +1024,8 @@ def run_apply(
                     "realname": realname,
                     "is_active": 1,
                     "comment": comment,
+                    "password": DEFAULT_PASSWORD,
+                    "password2": DEFAULT_PASSWORD,
                 },
             )
 
@@ -1155,6 +1163,12 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    if args.apply and not DEFAULT_PASSWORD:
+        raise RuntimeError(
+            "GLPI_DEFAULT_PASSWORD não definido. "
+            "Defina a senha padrão em /root/.glpi.env antes do --apply."
+        )
 
     rows, skipped = read_rows(args.xlsx)
 
