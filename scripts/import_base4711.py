@@ -999,12 +999,17 @@ def dry_run_report(
         f"  Container: {container.get('label')} "
         f"(ID {container.get('id')}, name={container.get('name')})"
     )
-    for key in ("status", "gerencia", "local"):
+    for key in ("status", "preposto", "gerencia", "local"):
         f = fields[key]
         print(
             f"  {key}: label='{f.get('label')}' "
             f"name='{f.get('name')}' type='{f.get('type')}'"
         )
+
+    preposto_column = user_reference_field_column(
+        clean_text(fields["preposto"]["name"])
+    )
+    print(f"  preposto API column='{preposto_column}'")
 
     print()
     print(
