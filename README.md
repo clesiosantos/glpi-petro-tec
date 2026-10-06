@@ -4,7 +4,7 @@ Projeto de implantação e automação do ambiente GLPI da operação Petrobras/
 
 ## Script de importação da Base 4711
 
-O arquivo `scripts/import_base4711.py` automatiza a carga da planilha **Base_dedados_4711.xlsx**, armazenada na raiz deste repositório, para o GLPI 10.
+O arquivo `scripts/import_base4711.py` automatiza a carga da planilha **Base_dedados_4711_com_Senior.xlsx**, armazenada na raiz deste repositório, para o GLPI 10.
 
 Principais regras implementadas:
 
@@ -40,9 +40,7 @@ export GLPI_APP_TOKEN='...'
 ```bash
 source /root/.glpi.env
 
-python3 scripts/import_base4711.py \
-  --senior-xlsx ./Acessos_GLPI_Petrobras_G4F.xlsx \
-  --dry-run
+python3 scripts/import_base4711.py --dry-run
 ```
 
 ## Implantação
@@ -50,9 +48,7 @@ python3 scripts/import_base4711.py \
 Somente após validar o `--dry-run`:
 
 ```bash
-python3 scripts/import_base4711.py \
-  --senior-xlsx ./Acessos_GLPI_Petrobras_G4F.xlsx \
-  --apply
+python3 scripts/import_base4711.py --apply
 ```
 
 > Não versionar tokens, arquivos `.env` ou planilhas contendo dados pessoais.
@@ -81,6 +77,4 @@ A Matrícula Senior é usada diretamente como login e como chave de integração
 
 Para corrigir usuários já implantados, o script localiza cada pessoa pelo nome atual, valida conflito de matrícula e altera o login preservando o mesmo `users_id`. Dessa forma, tickets, perfis, grupos e demais vínculos continuam ligados ao mesmo usuário.
 
-Se a `Base_dedados_4711.xlsx` não possuir a coluna `Matricula Senior`, informe uma planilha local de mapeamento com as colunas `Nome` e `Matricula Senior` na aba `Acessos GLPI`.
-
-A planilha de mapeamento não deve ser versionada no repositório.
+A planilha `Base_dedados_4711_com_Senior.xlsx` deve conter obrigatoriamente a coluna `Matricula Senior` na aba `Posto de Trabalho e Fiscais`. O script usa essa coluna diretamente como login do GLPI.
