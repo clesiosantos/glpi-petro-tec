@@ -21,7 +21,8 @@ Regras implementadas:
     * associa o perfil indicado ao usuário na entidade G4F, recursivo
     * define esse perfil como padrão do usuário
 - Usuário:
-    * login = primeiro nome normalizado + 4 dígitos pseudoaleatórios estáveis
+    * login = Matrícula Senior
+    * para usuários já implantados, o login é migrado para a Matrícula Senior preservando o users_id
     * primeiro nome / último nome são derivados de NOME DO TECNICO
     * comentário = "ITEM PPU: <valor> :: PREPOSTO: <valor>"
     * grupo padrão = grupo criado a partir de GERENCIA LOTACAO
@@ -39,11 +40,10 @@ Modos:
 
 Exemplo:
   source /root/.glpi.env
-  python3 scripts/import_base4711.py --dry-run
+  python3 scripts/import_base4711.py --senior-xlsx ./Acessos_GLPI_Petrobras_G4F.xlsx --dry-run
 """
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -71,7 +71,11 @@ except ImportError:
 
 DEFAULT_API_URL = "https://tec.g4f.sharksolucoes.com.br/apirest.php"
 DEFAULT_XLSX = str(Path(__file__).resolve().parents[1] / "Base_dedados_4711.xlsx")
+DEFAULT_SENIOR_XLSX = str(
+    Path(__file__).resolve().parents[1] / "Acessos_GLPI_Petrobras_G4F.xlsx"
+)
 SHEET_NAME = "Posto de Trabalho e Fiscais"
+SENIOR_SHEET_NAME = "Acessos GLPI"
 
 ROOT_ENTITY_ID = 0
 ADMIN_PROFILE_ID = 4  # ZZ-Super-Admin
@@ -155,14 +159,6 @@ def normalize_compare(value: str) -> str:
     return value
 
 
-def ascii_slug(value: str) -> str:
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(ch for ch in value if not unicodedata.combining(ch))
-    value = value.lower()
-    value = re.sub(r"[^a-z0-9]", "", value)
-    return value
-
-
 def excel_code(value: Any) -> str:
     """Preserva códigos como 1.1, 3.3 e 0 sem transformar 0 em 0.0."""
     if value is None:
@@ -185,17 +181,6 @@ def split_name(full_name: str) -> Tuple[str, str]:
     firstname = parts[0]
     realname = " ".join(parts[1:]) if len(parts) > 1 else ""
     return firstname, realname
-
-
-def stable_login(full_name: str, salt: int = 0) -> str:
-    firstname, _ = split_name(full_name)
-    base = ascii_slug(firstname) or "usuario"
-
-    material = f"{normalize_compare(full_name)}|{salt}".encode("utf-8")
-    digest = hashlib.sha256(material).digest()
-    number = int.from_bytes(digest[:4], "big") % 9000 + 1000
-
-    return f"{base}{number}"
 
 
 def chunked(iterable: Iterable[Any], size: int) -> Iterable[List[Any]]:
@@ -372,13 +357,99 @@ class GLPI:
             )
 
 
-def read_rows(xlsx_path: str) -> Tuple[List[Dict[str, str]], List[int]]:
+
+def normalized_header_index(headers: List[Any]) -> Dict[str, int]:
+    return {
+        normalize_compare(clean_text(value)): idx
+        for idx, value in enumerate(headers)
+        if clean_text(value)
+    }
+
+
+def load_senior_login_map(xlsx_path: str) -> Dict[str, str]:
+    """Lê Nome -> Matrícula Senior da aba Acessos GLPI."""
+    if not xlsx_path or not os.path.exists(xlsx_path):
+        return {}
+
+    book = load_workbook(xlsx_path, read_only=True, data_only=True)
+
+    if SENIOR_SHEET_NAME not in book.sheetnames:
+        book.close()
+        raise RuntimeError(
+            f"Aba '{SENIOR_SHEET_NAME}' não encontrada em {xlsx_path}. "
+            f"Abas disponíveis: {book.sheetnames}"
+        )
+
+    ws = book[SENIOR_SHEET_NAME]
+    headers = [cell.value for cell in ws[5]]
+    index = normalized_header_index(headers)
+
+    nome_key = normalize_compare("Nome")
+    matricula_key = normalize_compare("Matricula Senior")
+
+    if nome_key not in index or matricula_key not in index:
+        book.close()
+        raise RuntimeError(
+            "A planilha de acessos precisa conter as colunas "
+            "'Nome' e 'Matricula Senior' na linha 5."
+        )
+
+    mapping: Dict[str, str] = {}
+    reverse: Dict[str, str] = {}
+
+    for excel_row, values in enumerate(
+        ws.iter_rows(min_row=6, values_only=True),
+        start=6,
+    ):
+        name = clean_text(values[index[nome_key]])
+        matricula = excel_code(values[index[matricula_key]])
+
+        if not name and not matricula:
+            continue
+
+        if not name or not matricula:
+            book.close()
+            raise RuntimeError(
+                f"Planilha Senior linha {excel_row}: "
+                "Nome ou Matricula Senior vazio."
+            )
+
+        name_norm = normalize_compare(name)
+        matricula_norm = normalize_compare(matricula)
+
+        previous = mapping.get(name_norm)
+        if previous and previous != matricula:
+            book.close()
+            raise RuntimeError(
+                f"Nome duplicado com matrículas diferentes na planilha Senior: "
+                f"{name}"
+            )
+
+        other_name = reverse.get(matricula_norm)
+        if other_name and other_name != name_norm:
+            book.close()
+            raise RuntimeError(
+                f"Matrícula Senior duplicada: {matricula}"
+            )
+
+        mapping[name_norm] = matricula
+        reverse[matricula_norm] = name_norm
+
+    book.close()
+    return mapping
+
+
+def read_rows(
+    xlsx_path: str,
+    senior_xlsx_path: Optional[str] = None,
+) -> Tuple[List[Dict[str, str]], List[int]]:
     if not os.path.exists(xlsx_path):
         raise RuntimeError(f"Planilha não encontrada: {xlsx_path}")
 
     book = load_workbook(xlsx_path, read_only=True, data_only=True)
 
     if SHEET_NAME not in book.sheetnames:
+        book.close()
         raise RuntimeError(
             f"Aba '{SHEET_NAME}' não encontrada. "
             f"Abas disponíveis: {book.sheetnames}"
@@ -387,6 +458,8 @@ def read_rows(xlsx_path: str) -> Tuple[List[Dict[str, str]], List[int]]:
     ws = book[SHEET_NAME]
 
     headers = [clean_text(cell.value) for cell in ws[1]]
+    index = {h: i for i, h in enumerate(headers)}
+    normalized_index = normalized_header_index(headers)
 
     required = [
         "NOME DO TECNICO",
@@ -398,13 +471,28 @@ def read_rows(xlsx_path: str) -> Tuple[List[Dict[str, str]], List[int]]:
         "PERFIL PADRÃO",
     ]
 
-    index = {h: i for i, h in enumerate(headers)}
-
     missing = [name for name in required if name not in index]
     if missing:
+        book.close()
         raise RuntimeError(
             f"Colunas obrigatórias ausentes: {', '.join(missing)}"
         )
+
+    senior_col_idx = normalized_index.get(
+        normalize_compare("Matricula Senior")
+    )
+
+    senior_map: Dict[str, str] = {}
+    if senior_col_idx is None:
+        senior_map = load_senior_login_map(senior_xlsx_path or "")
+
+        if not senior_map:
+            book.close()
+            raise RuntimeError(
+                "A coluna 'Matricula Senior' não existe na Base 4711 e "
+                "nenhuma planilha de mapeamento foi encontrada. "
+                "Informe --senior-xlsx com a planilha Acessos GLPI."
+            )
 
     rows: List[Dict[str, str]] = []
     skipped: List[int] = []
@@ -424,9 +512,22 @@ def read_rows(xlsx_path: str) -> Tuple[List[Dict[str, str]], List[int]]:
             skipped.append(excel_row)
             continue
 
+        if senior_col_idx is not None:
+            senior_login = excel_code(values[senior_col_idx])
+        else:
+            senior_login = senior_map.get(normalize_compare(name), "")
+
+        if not senior_login:
+            book.close()
+            raise RuntimeError(
+                f"Linha {excel_row}: Matrícula Senior não localizada "
+                f"para '{name}'."
+            )
+
         row = {
             "excel_row": str(excel_row),
             "full_name": name,
+            "login": senior_login,
             "gerencia": clean_text(
                 values[index["GERENCIA LOTACAO"]]
             ),
@@ -447,8 +548,9 @@ def read_rows(xlsx_path: str) -> Tuple[List[Dict[str, str]], List[int]]:
             ),
         }
 
-        for key in ("gerencia", "local", "status", "profile"):
+        for key in ("login", "gerencia", "local", "status", "profile"):
             if not row[key]:
+                book.close()
                 raise RuntimeError(
                     f"Linha {excel_row}: campo obrigatório vazio: {key}"
                 )
@@ -457,8 +559,17 @@ def read_rows(xlsx_path: str) -> Tuple[List[Dict[str, str]], List[int]]:
 
     book.close()
 
-    return rows, skipped
+    login_counter = Counter(normalize_compare(r["login"]) for r in rows)
+    duplicated_logins = sorted(
+        login for login, count in login_counter.items() if count > 1
+    )
+    if duplicated_logins:
+        raise RuntimeError(
+            "Matrículas Senior duplicadas na carga: "
+            + ", ".join(duplicated_logins)
+        )
 
+    return rows, skipped
 
 def find_container_and_fields(
     glpi: GLPI,
@@ -587,18 +698,57 @@ def build_existing_user_maps(
 
     return by_login, by_fullname
 
-
-def choose_login(
-    full_name: str,
+def resolve_user_for_row(
+    row: Dict[str, str],
     users_by_login: Dict[str, Dict[str, Any]],
-) -> str:
-    for salt in range(100):
-        login = stable_login(full_name, salt)
-        if normalize_compare(login) not in users_by_login:
-            return login
-    raise RuntimeError(
-        f"Não foi possível gerar login livre para: {full_name}"
-    )
+    users_by_fullname: Dict[str, List[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Localiza por nome ou Matrícula Senior e bloqueia colisões."""
+    fullname_key = normalize_compare(row["full_name"])
+    desired_login_key = normalize_compare(row["login"])
+
+    matches = users_by_fullname.get(fullname_key, [])
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Mais de um usuário existente com o nome '{row['full_name']}'."
+        )
+
+    by_name = matches[0] if matches else None
+    by_login = users_by_login.get(desired_login_key)
+
+    if by_name and by_login:
+        if int(by_name["id"]) != int(by_login["id"]):
+            raise RuntimeError(
+                f"Conflito de login: Matrícula Senior {row['login']} já pertence "
+                f"ao usuário ID={by_login.get('id')} login='{by_login.get('name')}', "
+                f"mas o nome '{row['full_name']}' corresponde ao "
+                f"usuário ID={by_name.get('id')}."
+            )
+        return by_name
+
+    if by_name:
+        return by_name
+
+    if by_login:
+        existing_fullname = normalize_compare(
+            " ".join(
+                x for x in [
+                    clean_text(by_login.get("firstname")),
+                    clean_text(by_login.get("realname")),
+                ]
+                if x
+            )
+        )
+        if existing_fullname and existing_fullname != fullname_key:
+            raise RuntimeError(
+                f"Conflito de login: Matrícula Senior {row['login']} já está "
+                f"em uso pelo usuário ID={by_login.get('id')} "
+                f"('{existing_fullname}')."
+            )
+        return by_login
+
+    return None
+
 
 
 def get_profiles_by_name(
@@ -761,30 +911,33 @@ def dry_run_report(
 
     existing_user_count = 0
     new_user_count = 0
-    generated_logins: List[Tuple[str, str]] = []
-
-    temp_logins = dict(users_by_login)
+    login_change_count = 0
+    already_senior_login_count = 0
+    new_logins: List[Tuple[str, str]] = []
+    login_changes: List[Tuple[str, str, str]] = []
 
     for row in rows:
-        fullname_key = normalize_compare(row["full_name"])
-        matches = users_by_fullname.get(fullname_key, [])
+        user = resolve_user_for_row(
+            row,
+            users_by_login,
+            users_by_fullname,
+        )
 
-        if len(matches) == 1:
+        if user:
             existing_user_count += 1
-            continue
+            current_login = clean_text(user.get("name"))
+            desired_login = row["login"]
 
-        if len(matches) > 1:
-            raise RuntimeError(
-                f"Mais de um usuário existente com o nome "
-                f"'{row['full_name']}'."
-            )
-
-        login = choose_login(row["full_name"], temp_logins)
-        temp_logins[normalize_compare(login)] = {
-            "name": login,
-        }
-        generated_logins.append((row["full_name"], login))
-        new_user_count += 1
+            if normalize_compare(current_login) != normalize_compare(desired_login):
+                login_change_count += 1
+                login_changes.append(
+                    (row["full_name"], current_login, desired_login)
+                )
+            else:
+                already_senior_login_count += 1
+        else:
+            new_user_count += 1
+            new_logins.append((row["full_name"], row["login"]))
 
     print()
     print("=" * 96)
@@ -797,6 +950,8 @@ def dry_run_report(
     print(f"Status únicos.........................: {len(statuses)}")
     print(f"Usuários já existentes pelo nome.....: {existing_user_count}")
     print(f"Usuários que seriam criados..........: {new_user_count}")
+    print(f"Logins que serão migrados p/ Senior..: {login_change_count}")
+    print(f"Logins já usando Matrícula Senior....: {already_senior_login_count}")
     print(f"Usuários que terão senha atualizada..: {existing_user_count}")
     print(
         "Senha padrão..........................: "
@@ -858,14 +1013,20 @@ def dry_run_report(
     )
 
     print()
-    print("Amostra dos logins que seriam criados:")
-    for full_name, login in generated_logins[:15]:
-        print(f"  {full_name} -> {login}")
+    print("Amostra das migrações de login:")
+    for full_name, old_login, new_login in login_changes[:15]:
+        print(f"  {full_name}: {old_login} -> {new_login}")
 
-    if len(generated_logins) > 15:
+    if len(login_changes) > 15:
         print(
-            f"  ... mais {len(generated_logins) - 15} usuário(s)"
+            f"  ... mais {len(login_changes) - 15} usuário(s)"
         )
+
+    if new_logins:
+        print()
+        print("Novos usuários que seriam criados:")
+        for full_name, login in new_logins[:15]:
+            print(f"  {full_name} -> {login}")
 
     print()
     print("Comentários dos usuários:")
@@ -990,27 +1151,29 @@ def run_apply(
 
     created_users = 0
     reused_users = 0
+    migrated_logins = 0
     updated_fields = 0
 
     for pos, row in enumerate(rows, start=1):
         full_name = row["full_name"]
         firstname, realname = split_name(full_name)
         fullname_key = normalize_compare(full_name)
+        desired_login = row["login"]
 
-        matches = users_by_fullname.get(fullname_key, [])
+        user = resolve_user_for_row(
+            row,
+            users_by_login,
+            users_by_fullname,
+        )
+        existed_before = user is not None
 
-        if len(matches) > 1:
-            raise RuntimeError(
-                f"Mais de um usuário existente para '{full_name}'."
-            )
-
-        if len(matches) == 1:
-            user = matches[0]
+        if existed_before:
             user_id = int(user["id"])
-            login = clean_text(user.get("name"))
+            old_login = clean_text(user.get("name"))
+            login = desired_login
             reused_users += 1
         else:
-            login = choose_login(full_name, users_by_login)
+            login = desired_login
 
             comment = (
                 f"ITEM PPU: {row['ppu']} :: "
@@ -1076,6 +1239,7 @@ def run_apply(
         # Para usuários que já existiam antes desta execução, redefine também
         # a senha para a senha inicial padrão configurada em GLPI_DEFAULT_PASSWORD.
         user_update = {
+            "name": login,
             "firstname": firstname,
             "realname": realname,
             "is_active": 1,
@@ -1085,7 +1249,7 @@ def run_apply(
             "groups_id": group_id,
         }
 
-        if len(matches) == 1:
+        if existed_before:
             user_update["password"] = DEFAULT_PASSWORD
             user_update["password2"] = DEFAULT_PASSWORD
 
@@ -1094,6 +1258,17 @@ def run_apply(
             user_id,
             user_update,
         )
+
+        if existed_before:
+            if normalize_compare(old_login) != normalize_compare(login):
+                users_by_login.pop(normalize_compare(old_login), None)
+                user["name"] = login
+                users_by_login[normalize_compare(login)] = user
+                migrated_logins += 1
+                print(
+                    f"ALTERADO login ID={user_id}: "
+                    f"{old_login} -> {login}"
+                )
 
         plugin_payload = {
             "items_id": user_id,
@@ -1140,6 +1315,7 @@ def run_apply(
     print("=" * 96)
     print(f"Usuários criados.....................: {created_users}")
     print(f"Usuários reaproveitados..............: {reused_users}")
+    print(f"Logins migrados para Matrícula Senior: {migrated_logins}")
     print(f"Usuários com campos dinâmicos gravados: {updated_fields}")
     print(f"Grupos processados...................: {len(group_ids)}")
     print(f"Gerências dropdown...................: {len(dropdown_ids['gerencia'])}")
@@ -1157,6 +1333,16 @@ def main() -> int:
         "--xlsx",
         default=DEFAULT_XLSX,
         help=f"Caminho do XLSX. Padrão: {DEFAULT_XLSX}",
+    )
+
+    parser.add_argument(
+        "--senior-xlsx",
+        default=DEFAULT_SENIOR_XLSX,
+        help=(
+            "Planilha com Nome e Matricula Senior. "
+            f"Padrão: {DEFAULT_SENIOR_XLSX}. "
+            "Ignorada se a Base 4711 já possuir a coluna Matricula Senior."
+        ),
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -1179,9 +1365,14 @@ def main() -> int:
             "Defina a senha padrão em /root/.glpi.env antes do --apply."
         )
 
-    rows, skipped = read_rows(args.xlsx)
+    rows, skipped = read_rows(
+        args.xlsx,
+        args.senior_xlsx,
+    )
 
     print(f"OK - planilha lida: {args.xlsx}")
+    if os.path.exists(args.senior_xlsx):
+        print(f"OK - mapeamento Senior: {args.senior_xlsx}")
     print(f"OK - {len(rows)} linha(s) válida(s)")
     print(f"OK - {len(skipped)} linha(s) ignorada(s)")
 
