@@ -5,7 +5,7 @@
 Importação da Base 4711 para GLPI 10.
 
 Origem:
-  Planilha: Base_dedados_4711.xlsx (na raiz do repositório)
+  Planilha: Base_dedados_4711_com_Senior.xlsx (na raiz do repositório)
   Aba:      Posto de Trabalho e Fiscais
 
 Regras implementadas:
@@ -40,7 +40,7 @@ Modos:
 
 Exemplo:
   source /root/.glpi.env
-  python3 scripts/import_base4711.py --senior-xlsx ./Acessos_GLPI_Petrobras_G4F.xlsx --dry-run
+  python3 scripts/import_base4711.py --dry-run
 """
 
 import argparse
@@ -70,12 +70,10 @@ except ImportError:
 
 
 DEFAULT_API_URL = "https://tec.g4f.sharksolucoes.com.br/apirest.php"
-DEFAULT_XLSX = str(Path(__file__).resolve().parents[1] / "Base_dedados_4711.xlsx")
-DEFAULT_SENIOR_XLSX = str(
-    Path(__file__).resolve().parents[1] / "Acessos_GLPI_Petrobras_G4F.xlsx"
+DEFAULT_XLSX = str(
+    Path(__file__).resolve().parents[1] / "Base_dedados_4711_com_Senior.xlsx"
 )
 SHEET_NAME = "Posto de Trabalho e Fiscais"
-SENIOR_SHEET_NAME = "Acessos GLPI"
 
 ROOT_ENTITY_ID = 0
 ADMIN_PROFILE_ID = 4  # ZZ-Super-Admin
@@ -366,82 +364,8 @@ def normalized_header_index(headers: List[Any]) -> Dict[str, int]:
     }
 
 
-def load_senior_login_map(xlsx_path: str) -> Dict[str, str]:
-    """Lê Nome -> Matrícula Senior da aba Acessos GLPI."""
-    if not xlsx_path or not os.path.exists(xlsx_path):
-        return {}
-
-    book = load_workbook(xlsx_path, read_only=True, data_only=True)
-
-    if SENIOR_SHEET_NAME not in book.sheetnames:
-        book.close()
-        raise RuntimeError(
-            f"Aba '{SENIOR_SHEET_NAME}' não encontrada em {xlsx_path}. "
-            f"Abas disponíveis: {book.sheetnames}"
-        )
-
-    ws = book[SENIOR_SHEET_NAME]
-    headers = [cell.value for cell in ws[5]]
-    index = normalized_header_index(headers)
-
-    nome_key = normalize_compare("Nome")
-    matricula_key = normalize_compare("Matricula Senior")
-
-    if nome_key not in index or matricula_key not in index:
-        book.close()
-        raise RuntimeError(
-            "A planilha de acessos precisa conter as colunas "
-            "'Nome' e 'Matricula Senior' na linha 5."
-        )
-
-    mapping: Dict[str, str] = {}
-    reverse: Dict[str, str] = {}
-
-    for excel_row, values in enumerate(
-        ws.iter_rows(min_row=6, values_only=True),
-        start=6,
-    ):
-        name = clean_text(values[index[nome_key]])
-        matricula = excel_code(values[index[matricula_key]])
-
-        if not name and not matricula:
-            continue
-
-        if not name or not matricula:
-            book.close()
-            raise RuntimeError(
-                f"Planilha Senior linha {excel_row}: "
-                "Nome ou Matricula Senior vazio."
-            )
-
-        name_norm = normalize_compare(name)
-        matricula_norm = normalize_compare(matricula)
-
-        previous = mapping.get(name_norm)
-        if previous and previous != matricula:
-            book.close()
-            raise RuntimeError(
-                f"Nome duplicado com matrículas diferentes na planilha Senior: "
-                f"{name}"
-            )
-
-        other_name = reverse.get(matricula_norm)
-        if other_name and other_name != name_norm:
-            book.close()
-            raise RuntimeError(
-                f"Matrícula Senior duplicada: {matricula}"
-            )
-
-        mapping[name_norm] = matricula
-        reverse[matricula_norm] = name_norm
-
-    book.close()
-    return mapping
-
-
 def read_rows(
     xlsx_path: str,
-    senior_xlsx_path: Optional[str] = None,
 ) -> Tuple[List[Dict[str, str]], List[int]]:
     if not os.path.exists(xlsx_path):
         raise RuntimeError(f"Planilha não encontrada: {xlsx_path}")
@@ -482,17 +406,11 @@ def read_rows(
         normalize_compare("Matricula Senior")
     )
 
-    senior_map: Dict[str, str] = {}
     if senior_col_idx is None:
-        senior_map = load_senior_login_map(senior_xlsx_path or "")
-
-        if not senior_map:
-            book.close()
-            raise RuntimeError(
-                "A coluna 'Matricula Senior' não existe na Base 4711 e "
-                "nenhuma planilha de mapeamento foi encontrada. "
-                "Informe --senior-xlsx com a planilha Acessos GLPI."
-            )
+        book.close()
+        raise RuntimeError(
+            "Coluna obrigatória ausente: Matricula Senior"
+        )
 
     rows: List[Dict[str, str]] = []
     skipped: List[int] = []
@@ -512,15 +430,12 @@ def read_rows(
             skipped.append(excel_row)
             continue
 
-        if senior_col_idx is not None:
-            senior_login = excel_code(values[senior_col_idx])
-        else:
-            senior_login = senior_map.get(normalize_compare(name), "")
+        senior_login = excel_code(values[senior_col_idx])
 
         if not senior_login:
             book.close()
             raise RuntimeError(
-                f"Linha {excel_row}: Matrícula Senior não localizada "
+                f"Linha {excel_row}: Matrícula Senior vazia "
                 f"para '{name}'."
             )
 
@@ -1335,16 +1250,6 @@ def main() -> int:
         help=f"Caminho do XLSX. Padrão: {DEFAULT_XLSX}",
     )
 
-    parser.add_argument(
-        "--senior-xlsx",
-        default=DEFAULT_SENIOR_XLSX,
-        help=(
-            "Planilha com Nome e Matricula Senior. "
-            f"Padrão: {DEFAULT_SENIOR_XLSX}. "
-            "Ignorada se a Base 4711 já possuir a coluna Matricula Senior."
-        ),
-    )
-
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument(
         "--dry-run",
@@ -1365,14 +1270,9 @@ def main() -> int:
             "Defina a senha padrão em /root/.glpi.env antes do --apply."
         )
 
-    rows, skipped = read_rows(
-        args.xlsx,
-        args.senior_xlsx,
-    )
+    rows, skipped = read_rows(args.xlsx)
 
     print(f"OK - planilha lida: {args.xlsx}")
-    if os.path.exists(args.senior_xlsx):
-        print(f"OK - mapeamento Senior: {args.senior_xlsx}")
     print(f"OK - {len(rows)} linha(s) válida(s)")
     print(f"OK - {len(skipped)} linha(s) ignorada(s)")
 
