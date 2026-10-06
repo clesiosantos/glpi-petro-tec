@@ -20,9 +20,13 @@ Regras implementadas:
 - Coluna E (PREPOSTO):
     * para usuários com perfil "Posto de Trabalho", vincula o campo dinâmico
       "Preposto" ao usuário GLPI correspondente pelo nome
-- Coluna J (PERFIL PADRÃO):
-    * associa o perfil indicado ao usuário na entidade G4F, recursivo
-    * define esse perfil como padrão do usuário
+- Coluna G (ITEM PPU) + Coluna J (PERFIL PADRÃO):
+    * perfil Preposto: autorização na entidade G4F, recursivo = Sim
+    * perfil Posto de Trabalho: autorização na entidade cujo nome inicia
+      pelo ITEM PPU (ex.: 3.3 -> "3.3 - ..."), recursivo = Sim
+    * para Posto de Trabalho, remove a autorização antiga do perfil
+      Posto de Trabalho diretamente na entidade G4F
+    * define perfil e entidade correspondentes como padrão do usuário
 - Usuário:
     * login = Matrícula Senior
     * para usuários já implantados, o login é migrado para a Matrícula Senior preservando o users_id
@@ -361,6 +365,20 @@ class GLPI:
                 f"PUT {itemtype}/{item_id}: "
                 f"HTTP {r.status_code}: {r.text}\n"
                 f"Payload: {json.dumps(body, ensure_ascii=False)}"
+            )
+
+
+    def purge(self, itemtype: str, item_id: int) -> None:
+        r = self.http.delete(
+            f"{API_URL}/{itemtype}/{item_id}",
+            params={"force_purge": "true"},
+            timeout=60,
+        )
+
+        if r.status_code not in (200, 201, 204):
+            raise RuntimeError(
+                f"DELETE {itemtype}/{item_id}: "
+                f"HTTP {r.status_code}: {r.text}"
             )
 
 
@@ -849,13 +867,122 @@ def ensure_group(
     return group_id
 
 
+
+def normalized_ppu_code(value: str) -> str:
+    return clean_text(value).rstrip(".").strip()
+
+
+def build_ppu_entity_map(
+    rows: List[Dict[str, str]],
+    entities: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Resolve ITEM PPU para a entidade de serviço de primeiro nível.
+    Exemplo: 3.3 -> "3.3 - Serviços de Engenharia Avançada ..."
+    """
+    ppu_codes = sorted(
+        {
+            normalized_ppu_code(r["ppu"])
+            for r in rows
+            if normalize_compare(r["profile"])
+            == normalize_compare("Posto de Trabalho")
+        }
+    )
+
+    result: Dict[str, Dict[str, Any]] = {}
+
+    for code in ppu_codes:
+        pattern = re.compile(
+            rf"^\s*{re.escape(code)}\s*[-–—]\s*",
+            flags=re.IGNORECASE,
+        )
+
+        matches = [
+            e
+            for e in entities
+            if pattern.search(clean_text(e.get("name")))
+        ]
+
+        if len(matches) == 0:
+            raise RuntimeError(
+                f"Entidade do ITEM PPU '{code}' não localizada. "
+                f"Esperado nome iniciando por '{code} - '."
+            )
+
+        if len(matches) > 1:
+            names = ", ".join(
+                f"ID={e.get('id')} '{e.get('name')}'"
+                for e in matches
+            )
+            raise RuntimeError(
+                f"ITEM PPU '{code}' encontrou mais de uma entidade: {names}"
+            )
+
+        result[code] = matches[0]
+
+    return result
+
+
+def desired_authorization(
+    row: Dict[str, str],
+    profiles_by_name: Dict[str, int],
+    ppu_entities: Dict[str, Dict[str, Any]],
+) -> Tuple[int, int]:
+    profile_id = profiles_by_name[
+        normalize_compare(row["profile"])
+    ]
+
+    if normalize_compare(row["profile"]) == normalize_compare(
+        "Preposto"
+    ):
+        return profile_id, ROOT_ENTITY_ID
+
+    if normalize_compare(row["profile"]) == normalize_compare(
+        "Posto de Trabalho"
+    ):
+        code = normalized_ppu_code(row["ppu"])
+        entity = ppu_entities[code]
+        return profile_id, int(entity["id"])
+
+    raise RuntimeError(
+        f"Perfil não tratado para autorização: {row['profile']}"
+    )
+
+
+def profile_user_rows_by_key(
+    profile_users: List[Dict[str, Any]],
+) -> Dict[Tuple[int, int, int, int], List[Dict[str, Any]]]:
+    result: Dict[
+        Tuple[int, int, int, int],
+        List[Dict[str, Any]],
+    ] = {}
+
+    for x in profile_users:
+        key = (
+            int(x.get("users_id") or 0),
+            int(x.get("profiles_id") or 0),
+            int(x.get("entities_id") or 0),
+            int(x.get("is_recursive") or 0),
+        )
+        result.setdefault(key, []).append(x)
+
+    return result
+
+
 def ensure_profile_user(
     glpi: GLPI,
     existing: set,
     user_id: int,
     profile_id: int,
+    entity_id: int,
+    is_recursive: int = 1,
 ) -> None:
-    key = (user_id, profile_id, ROOT_ENTITY_ID, 1)
+    key = (
+        int(user_id),
+        int(profile_id),
+        int(entity_id),
+        int(is_recursive),
+    )
 
     if key in existing:
         return
@@ -865,8 +992,8 @@ def ensure_profile_user(
         {
             "users_id": user_id,
             "profiles_id": profile_id,
-            "entities_id": ROOT_ENTITY_ID,
-            "is_recursive": 1,
+            "entities_id": entity_id,
+            "is_recursive": is_recursive,
             "is_dynamic": 0,
         },
     )
@@ -903,6 +1030,8 @@ def dry_run_report(
     profiles_by_name: Dict[str, int],
     groups_map: Dict[str, Dict[str, Any]],
     users: List[Dict[str, Any]],
+    entities: List[Dict[str, Any]],
+    profile_users: List[Dict[str, Any]],
     dropdown_maps: Dict[str, Dict[str, Dict[str, Any]]],
     container: Dict[str, Any],
     fields: Dict[str, Dict[str, Any]],
@@ -919,6 +1048,11 @@ def dry_run_report(
         rows,
         users_by_fullname,
     )
+    ppu_entities = build_ppu_entity_map(
+        rows,
+        entities,
+    )
+    profile_user_map = profile_user_rows_by_key(profile_users)
 
     existing_user_count = 0
     new_user_count = 0
@@ -1045,6 +1179,59 @@ def dry_run_report(
             print(f"  {full_name} -> {login}")
 
     print()
+    print("Autorizações por ITEM PPU:")
+    for code in sorted(ppu_entities):
+        entity = ppu_entities[code]
+        print(
+            f"  - {code}: Entity ID {entity.get('id')} "
+            f"| {entity.get('name')} "
+            f"| Perfil=Posto de Trabalho | Recursivo=Sim"
+        )
+
+    preposto_rows = [
+        r for r in rows
+        if normalize_compare(r["profile"])
+        == normalize_compare("Preposto")
+    ]
+    print()
+    print("Autorizações de Prepostos:")
+    print(
+        f"  - {len(preposto_rows)} usuário(s) "
+        "na entidade G4F | Perfil=Preposto | Recursivo=Sim"
+    )
+
+    wrong_root_auth = 0
+    posto_profile_id = profiles_by_name[
+        normalize_compare("Posto de Trabalho")
+    ]
+    for row in rows:
+        if normalize_compare(row["profile"]) != normalize_compare(
+            "Posto de Trabalho"
+        ):
+            continue
+
+        user = resolve_user_for_row(
+            row,
+            users_by_login,
+            users_by_fullname,
+        )
+        if not user:
+            continue
+
+        key = (
+            int(user["id"]),
+            int(posto_profile_id),
+            ROOT_ENTITY_ID,
+            1,
+        )
+        wrong_root_auth += len(profile_user_map.get(key, []))
+
+    print(
+        "  Autorizações antigas Posto de Trabalho em G4F "
+        f"a remover.............................: {wrong_root_auth}"
+    )
+
+    print()
     print("Comentários dos usuários:")
     print(
         "  ITEM PPU: <coluna G> :: PREPOSTO: <coluna E>"
@@ -1083,6 +1270,7 @@ def run_apply(
     profiles_by_name: Dict[str, int],
     groups_map: Dict[str, Dict[str, Any]],
     users: List[Dict[str, Any]],
+    entities: List[Dict[str, Any]],
     profile_users: List[Dict[str, Any]],
     group_users: List[Dict[str, Any]],
     container: Dict[str, Any],
@@ -1097,6 +1285,11 @@ def run_apply(
         rows,
         users_by_fullname,
     )
+    ppu_entities = build_ppu_entity_map(
+        rows,
+        entities,
+    )
+    profile_user_map = profile_user_rows_by_key(profile_users)
 
     profile_user_existing = {
         (
@@ -1188,6 +1381,7 @@ def run_apply(
     reused_users = 0
     migrated_logins = 0
     linked_prepostos = 0
+    removed_root_authorizations = 0
     updated_fields = 0
 
     for pos, row in enumerate(rows, start=1):
@@ -1248,9 +1442,11 @@ def run_apply(
                 f"{full_name} -> {login}"
             )
 
-        profile_id = profiles_by_name[
-            normalize_compare(row["profile"])
-        ]
+        profile_id, authorization_entity_id = desired_authorization(
+            row,
+            profiles_by_name,
+            ppu_entities,
+        )
         group_id = group_ids[row["gerencia"]]
 
         ensure_profile_user(
@@ -1258,6 +1454,8 @@ def run_apply(
             profile_user_existing,
             user_id,
             profile_id,
+            authorization_entity_id,
+            1,
         )
         ensure_group_user(
             glpi,
@@ -1281,7 +1479,7 @@ def run_apply(
             "is_active": 1,
             "comment": comment,
             "profiles_id": profile_id,
-            "entities_id": ROOT_ENTITY_ID,
+            "entities_id": authorization_entity_id,
             "groups_id": group_id,
         }
 
@@ -1305,6 +1503,30 @@ def run_apply(
                     f"ALTERADO login ID={user_id}: "
                     f"{old_login} -> {login}"
                 )
+
+        if (
+            normalize_compare(row["profile"])
+            == normalize_compare("Posto de Trabalho")
+            and authorization_entity_id != ROOT_ENTITY_ID
+        ):
+            root_key = (
+                int(user_id),
+                int(profile_id),
+                ROOT_ENTITY_ID,
+                1,
+            )
+            for auth_row in list(profile_user_map.get(root_key, [])):
+                auth_id = int(auth_row.get("id") or 0)
+                if auth_id <= 0:
+                    continue
+                glpi.purge("Profile_User", auth_id)
+                removed_root_authorizations += 1
+                print(
+                    f"REMOVIDA autorização antiga Profile_User ID={auth_id}: "
+                    f"user={user_id} perfil={profile_id} entidade=G4F"
+                )
+            profile_user_map[root_key] = []
+            profile_user_existing.discard(root_key)
 
         plugin_payload = {
             "items_id": user_id,
@@ -1352,6 +1574,7 @@ def run_apply(
             f"local='{row['local']}' "
             f"status='{row['status']}' "
             f"perfil='{row['profile']}' "
+            f"entidade_autorizacao={authorization_entity_id} "
             + (
                 f"preposto='{row['preposto']}'"
                 if normalize_compare(row["profile"])
@@ -1368,6 +1591,10 @@ def run_apply(
     print(f"Usuários reaproveitados..............: {reused_users}")
     print(f"Logins migrados para Matrícula Senior: {migrated_logins}")
     print(f"Postos vinculados ao Preposto........: {linked_prepostos}")
+    print(
+        "Autorizações antigas G4F removidas...: "
+        f"{removed_root_authorizations}"
+    )
     print(f"Usuários com campos dinâmicos gravados: {updated_fields}")
     print(f"Grupos processados...................: {len(group_ids)}")
     print(f"Gerências dropdown...................: {len(dropdown_ids['gerencia'])}")
@@ -1507,6 +1734,18 @@ def main() -> int:
         groups_map = map_existing_groups(groups)
 
         users = glpi.get_all("User")
+        entities = glpi.get_all("Entity")
+        profile_users = glpi.get_all("Profile_User")
+
+        # Valida o mapeamento ITEM PPU -> Entidade antes de qualquer gravação.
+        ppu_entities = build_ppu_entity_map(rows, entities)
+        print(
+            "OK - ITEM PPU mapeado para entidade: "
+            + ", ".join(
+                f"{code}=ID {ppu_entities[code]['id']}"
+                for code in sorted(ppu_entities)
+            )
+        )
 
         if args.dry_run:
             dry_run_report(
@@ -1515,6 +1754,8 @@ def main() -> int:
                 profiles_by_name,
                 groups_map,
                 users,
+                entities,
+                profile_users,
                 dropdown_maps,
                 container,
                 fields,
@@ -1523,7 +1764,6 @@ def main() -> int:
             )
             return 0
 
-        profile_users = glpi.get_all("Profile_User")
         group_users = glpi.get_all("Group_User")
 
         run_apply(
@@ -1532,6 +1772,7 @@ def main() -> int:
             profiles_by_name,
             groups_map,
             users,
+            entities,
             profile_users,
             group_users,
             container,
