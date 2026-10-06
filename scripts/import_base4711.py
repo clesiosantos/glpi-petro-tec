@@ -17,6 +17,9 @@ Regras implementadas:
     * cria/garante o valor no campo dinâmico "Localização fisica Gerencia"
 - Coluna D (STATUS DA MOBILIZACAO):
     * cria/garante o valor no campo dinâmico "Status Mobilização"
+- Coluna E (PREPOSTO):
+    * para usuários com perfil "Posto de Trabalho", vincula o campo dinâmico
+      "Preposto" ao usuário GLPI correspondente pelo nome
 - Coluna J (PERFIL PADRÃO):
     * associa o perfil indicado ao usuário na entidade G4F, recursivo
     * define esse perfil como padrão do usuário
@@ -29,8 +32,13 @@ Regras implementadas:
     * senha inicial padrão = variável GLPI_DEFAULT_PASSWORD
 - Linhas cujo NOME DO TECNICO seja "não mobilizar de imediato" são IGNORADAS.
 
-Campos dinâmicos que NÃO serão preenchidos nesta primeira carga:
-- Preposto
+Campos dinâmicos preenchidos:
+- Status Mobilização
+- Preposto (somente para perfil Posto de Trabalho)
+- Localização fisica Gerencia
+- Gerencia Lotação
+
+Campos dinâmicos que NÃO serão preenchidos:
 - Chave Colaborador
 - Líder
 
@@ -82,6 +90,7 @@ CONTAINER_LABEL = "Agrupamento"
 CONTAINER_ITEMTYPE = "User"
 
 FIELD_LABEL_STATUS = "Status Mobilização"
+FIELD_LABEL_PREPOSTO = "Preposto"
 FIELD_LABEL_GERENCIA = "Gerencia Lotação"
 FIELD_LABEL_LOCAL = "Localização fisica Gerencia"
 
@@ -530,6 +539,7 @@ def find_container_and_fields(
 
     wanted = {
         normalize_compare(FIELD_LABEL_STATUS): "status",
+        normalize_compare(FIELD_LABEL_PREPOSTO): "preposto",
         normalize_compare(FIELD_LABEL_GERENCIA): "gerencia",
         normalize_compare(FIELD_LABEL_LOCAL): "local",
     }
@@ -548,6 +558,7 @@ def find_container_and_fields(
         label
         for key, label in [
             ("status", FIELD_LABEL_STATUS),
+            ("preposto", FIELD_LABEL_PREPOSTO),
             ("gerencia", FIELD_LABEL_GERENCIA),
             ("local", FIELD_LABEL_LOCAL),
         ]
@@ -560,12 +571,26 @@ def find_container_and_fields(
             f"'{CONTAINER_LABEL}': {', '.join(missing)}"
         )
 
-    for key, field in selected.items():
+    for key in ("status", "preposto", "gerencia", "local"):
+        field = selected[key]
         if clean_text(field.get("type")) != "dropdown":
             raise RuntimeError(
                 f"Campo '{field.get('label')}' não é do tipo dropdown. "
                 f"Tipo encontrado: {field.get('type')}"
             )
+
+    preposto_type = clean_text(selected["preposto"].get("type"))
+    if normalize_compare(preposto_type) not in {
+        normalize_compare("dropdown-User"),
+        normalize_compare("User"),
+        normalize_compare("Users"),
+        normalize_compare("Usuários"),
+        normalize_compare("Usuarios"),
+    }:
+        raise RuntimeError(
+            f"Campo '{FIELD_LABEL_PREPOSTO}' não é referência de usuário. "
+            f"Tipo encontrado: {preposto_type}"
+        )
 
     return target_container, selected
 
@@ -586,6 +611,12 @@ def container_instance_itemtype(container_name: str) -> str:
     name = re.sub(r"s$", "", container_name, flags=re.IGNORECASE)
     system_name = ("User" + name).lower()
     return "PluginFields" + system_name[0].upper() + system_name[1:]
+
+
+def user_reference_field_column(field_internal_name: str) -> str:
+    if not field_internal_name:
+        raise RuntimeError("Nome interno do campo Preposto está vazio.")
+    return f"users_id_{field_internal_name}"
 
 
 def build_existing_user_maps(
@@ -664,6 +695,60 @@ def resolve_user_for_row(
 
     return None
 
+
+
+
+def resolve_preposto_user(
+    preposto_name: str,
+    users_by_fullname: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    key = normalize_compare(preposto_name)
+    matches = users_by_fullname.get(key, [])
+
+    if len(matches) == 0:
+        raise RuntimeError(
+            f"Preposto '{preposto_name}' não localizado entre os usuários do GLPI."
+        )
+
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Mais de um usuário GLPI localizado para o preposto "
+            f"'{preposto_name}'."
+        )
+
+    return matches[0]
+
+
+def build_preposto_user_ids(
+    rows: List[Dict[str, str]],
+    users_by_fullname: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, int]:
+    result: Dict[str, int] = {}
+
+    for row in rows:
+        if normalize_compare(row["profile"]) != normalize_compare(
+            "Posto de Trabalho"
+        ):
+            continue
+
+        preposto_name = clean_text(row["preposto"])
+        if not preposto_name:
+            raise RuntimeError(
+                f"Linha {row['excel_row']}: PREPOSTO vazio para "
+                f"'{row['full_name']}'."
+            )
+
+        key = normalize_compare(preposto_name)
+        if key in result:
+            continue
+
+        user = resolve_preposto_user(
+            preposto_name,
+            users_by_fullname,
+        )
+        result[key] = int(user["id"])
+
+    return result
 
 
 def get_profiles_by_name(
@@ -823,6 +908,10 @@ def dry_run_report(
     profiles = sorted({r["profile"] for r in rows})
 
     users_by_login, users_by_fullname = build_existing_user_maps(users)
+    preposto_user_ids = build_preposto_user_ids(
+        rows,
+        users_by_fullname,
+    )
 
     existing_user_count = 0
     new_user_count = 0
@@ -950,8 +1039,20 @@ def dry_run_report(
     )
 
     print()
+    print("Vínculo de Prepostos:")
+    postos = [
+        r for r in rows
+        if normalize_compare(r["profile"])
+        == normalize_compare("Posto de Trabalho")
+    ]
+    print(f"  Postos de Trabalho a vincular......: {len(postos)}")
+    print(f"  Prepostos únicos localizados........: {len(preposto_user_ids)}")
+    for preposto_name in sorted({r["preposto"] for r in postos}):
+        pid = preposto_user_ids[normalize_compare(preposto_name)]
+        print(f"  - {preposto_name}: User ID {pid}")
+
+    print()
     print("Campos NÃO preenchidos nesta etapa:")
-    print("  - Preposto (campo dinâmico)")
     print("  - Chave Colaborador")
     print("  - Líder")
 
@@ -980,6 +1081,10 @@ def run_apply(
     instance_rows: List[Dict[str, Any]],
 ) -> None:
     users_by_login, users_by_fullname = build_existing_user_maps(users)
+    preposto_user_ids = build_preposto_user_ids(
+        rows,
+        users_by_fullname,
+    )
 
     profile_user_existing = {
         (
@@ -1055,6 +1160,9 @@ def run_apply(
     col_status = (
         f"plugin_fields_{field_names['status']}dropdowns_id"
     )
+    col_preposto = user_reference_field_column(
+        field_names["preposto"]
+    )
     col_gerencia = (
         f"plugin_fields_{field_names['gerencia']}dropdowns_id"
     )
@@ -1067,6 +1175,7 @@ def run_apply(
     created_users = 0
     reused_users = 0
     migrated_logins = 0
+    linked_prepostos = 0
     updated_fields = 0
 
     for pos, row in enumerate(rows, start=1):
@@ -1194,6 +1303,15 @@ def run_apply(
             col_local: dropdown_ids["local"][row["local"]],
         }
 
+        if normalize_compare(row["profile"]) == normalize_compare(
+            "Posto de Trabalho"
+        ):
+            preposto_id = preposto_user_ids[
+                normalize_compare(row["preposto"])
+            ]
+            plugin_payload[col_preposto] = preposto_id
+            linked_prepostos += 1
+
         existing_instance = instance_by_user_id.get(user_id)
 
         if existing_instance:
@@ -1221,7 +1339,13 @@ def run_apply(
             f"grupo='{row['gerencia']}' "
             f"local='{row['local']}' "
             f"status='{row['status']}' "
-            f"perfil='{row['profile']}'"
+            f"perfil='{row['profile']}' "
+            + (
+                f"preposto='{row['preposto']}'"
+                if normalize_compare(row["profile"])
+                == normalize_compare("Posto de Trabalho")
+                else ""
+            )
         )
 
     print()
@@ -1231,6 +1355,7 @@ def run_apply(
     print(f"Usuários criados.....................: {created_users}")
     print(f"Usuários reaproveitados..............: {reused_users}")
     print(f"Logins migrados para Matrícula Senior: {migrated_logins}")
+    print(f"Postos vinculados ao Preposto........: {linked_prepostos}")
     print(f"Usuários com campos dinâmicos gravados: {updated_fields}")
     print(f"Grupos processados...................: {len(group_ids)}")
     print(f"Gerências dropdown...................: {len(dropdown_ids['gerencia'])}")
