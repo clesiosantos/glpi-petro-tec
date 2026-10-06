@@ -86,3 +86,13 @@ A planilha `Base_dedados_4711_com_Senior.xlsx` deve conter obrigatoriamente a co
 Para usuários com perfil **Posto de Trabalho**, o importador usa a coluna `PREPOSTO` da Base 4711, localiza o usuário GLPI correspondente pelo nome e grava seu `users_id` no campo dinâmico **Preposto** do container **Agrupamento**.
 
 O campo **Preposto** é uma referência GLPI para `User`; o importador deriva a chave REST no padrão `users_id_<nome_interno>` a partir do próprio cadastro do campo no plugin Fields. Antes de qualquer gravação, o `--dry-run` valida que todos os prepostos foram localizados de forma única.
+
+
+## Autorização por ITEM PPU
+
+As autorizações dos usuários seguem a regra:
+
+- **Preposto**: entidade **G4F**, perfil **Preposto**, recursividade **Sim**.
+- **Posto de Trabalho**: o valor de **ITEM PPU** determina a entidade. Exemplo: `3.3` é associado à entidade cujo nome inicia por `3.3 - `; o perfil é **Posto de Trabalho** e a recursividade é **Sim**.
+- Para os Postos de Trabalho já implantados, o importador remove a autorização antiga do perfil **Posto de Trabalho** diretamente na entidade raiz **G4F**, evitando acesso além do escopo do ITEM PPU.
+- A entidade da autorização também é definida como entidade padrão do usuário.
