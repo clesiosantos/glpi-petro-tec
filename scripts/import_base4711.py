@@ -571,7 +571,7 @@ def find_container_and_fields(
             f"'{CONTAINER_LABEL}': {', '.join(missing)}"
         )
 
-    for key in ("status", "preposto", "gerencia", "local"):
+    for key in ("status", "gerencia", "local"):
         field = selected[key]
         if clean_text(field.get("type")) != "dropdown":
             raise RuntimeError(
@@ -1445,8 +1445,8 @@ def main() -> int:
         )
 
         dropdown_itemtypes = {
-            key: dropdown_itemtype(clean_text(field["name"]))
-            for key, field in fields.items()
+            key: dropdown_itemtype(clean_text(fields[key]["name"]))
+            for key in ("status", "gerencia", "local")
         }
 
         dropdown_maps: Dict[
