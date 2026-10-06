@@ -616,6 +616,13 @@ def container_instance_itemtype(container_name: str) -> str:
 def user_reference_field_column(field_internal_name: str) -> str:
     if not field_internal_name:
         raise RuntimeError("Nome interno do campo Preposto está vazio.")
+
+    # No plugin Fields o nome interno de campos do tipo User pode já vir
+    # completo, por exemplo: users_id_prepostofield.
+    # Nesse caso, não devemos prefixar users_id_ novamente.
+    if field_internal_name.startswith("users_id_"):
+        return field_internal_name
+
     return f"users_id_{field_internal_name}"
 
 
