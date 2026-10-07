@@ -10,9 +10,12 @@ Origem:
 
 Regras implementadas:
 - Coluna B (GERENCIA LOTACAO):
-    * cria/garante um Grupo GLPI na entidade G4F
-    * associa o usuário ao grupo
     * cria/garante o valor no campo dinâmico "Gerencia Lotação"
+    * NÃO associa o usuário a Grupo GLPI
+- Grupos:
+    * usuários importados não devem possuir associação a grupos
+    * associações Group_User existentes são removidas
+    * grupo padrão do usuário é limpo (groups_id = 0)
 - Coluna C (LOCAL):
     * cria/garante o valor no campo dinâmico "Localização fisica Gerencia"
 - Coluna D (STATUS DA MOBILIZACAO):
@@ -1028,10 +1031,10 @@ def dry_run_report(
     rows: List[Dict[str, str]],
     skipped: List[int],
     profiles_by_name: Dict[str, int],
-    groups_map: Dict[str, Dict[str, Any]],
     users: List[Dict[str, Any]],
     entities: List[Dict[str, Any]],
     profile_users: List[Dict[str, Any]],
+    group_users: List[Dict[str, Any]],
     dropdown_maps: Dict[str, Dict[str, Dict[str, Any]]],
     container: Dict[str, Any],
     fields: Dict[str, Dict[str, Any]],
@@ -1110,16 +1113,15 @@ def dry_run_report(
         print(f"  - {profile}: ID {pid}")
 
     print()
-    print("Grupos / Gerencia Lotação:")
+    print("Gerencia Lotação (campo dinâmico):")
     for name in gerencias:
-        exists = normalize_compare(name) in groups_map
         dd_exists = (
             normalize_compare(name)
             in dropdown_maps["gerencia"]
         )
         print(
-            f"  - {name} | grupo={'EXISTE' if exists else 'CRIAR'} "
-            f"| dropdown={'EXISTE' if dd_exists else 'CRIAR'}"
+            f"  - {name}: "
+            f"{'EXISTE' if dd_exists else 'CRIAR'}"
         )
 
     print()
@@ -1231,6 +1233,31 @@ def dry_run_report(
         f"a remover.............................: {wrong_root_auth}"
     )
 
+    target_user_ids = set()
+    for row in rows:
+        user = resolve_user_for_row(
+            row,
+            users_by_login,
+            users_by_fullname,
+        )
+        if user:
+            target_user_ids.add(int(user["id"]))
+
+    group_links_to_remove = [
+        x
+        for x in group_users
+        if int(x.get("users_id") or 0) in target_user_ids
+    ]
+
+    print()
+    print("Grupos dos usuários:")
+    print("  Associação a Grupo GLPI.............: NÃO")
+    print(
+        "  Vínculos Group_User a remover.......: "
+        f"{len(group_links_to_remove)}"
+    )
+    print("  Grupo padrão após aplicação.........: nenhum (groups_id=0)")
+
     print()
     print("Comentários dos usuários:")
     print(
@@ -1290,6 +1317,11 @@ def run_apply(
         entities,
     )
     profile_user_map = profile_user_rows_by_key(profile_users)
+    group_user_rows_by_user: Dict[int, List[Dict[str, Any]]] = {}
+    for link in group_users:
+        uid = int(link.get("users_id") or 0)
+        if uid > 0:
+            group_user_rows_by_user.setdefault(uid, []).append(link)
 
     profile_user_existing = {
         (
@@ -1301,14 +1333,6 @@ def run_apply(
         for x in profile_users
     }
 
-    group_user_existing = {
-        (
-            int(x.get("users_id") or 0),
-            int(x.get("groups_id") or 0),
-        )
-        for x in group_users
-    }
-
     instance_by_user_id = {
         int(x.get("items_id") or 0): x
         for x in instance_rows
@@ -1318,14 +1342,6 @@ def run_apply(
     gerencias = sorted({r["gerencia"] for r in rows})
     locais = sorted({r["local"] for r in rows})
     statuses = sorted({r["status"] for r in rows})
-
-    group_ids: Dict[str, int] = {}
-    for name in gerencias:
-        group_ids[name] = ensure_group(
-            glpi,
-            groups_map,
-            name,
-        )
 
     dropdown_ids: Dict[str, Dict[str, int]] = {
         "gerencia": {},
@@ -1382,6 +1398,7 @@ def run_apply(
     migrated_logins = 0
     linked_prepostos = 0
     removed_root_authorizations = 0
+    removed_group_links = 0
     updated_fields = 0
 
     for pos, row in enumerate(rows, start=1):
@@ -1447,7 +1464,6 @@ def run_apply(
             profiles_by_name,
             ppu_entities,
         )
-        group_id = group_ids[row["gerencia"]]
 
         ensure_profile_user(
             glpi,
@@ -1457,13 +1473,6 @@ def run_apply(
             authorization_entity_id,
             1,
         )
-        ensure_group_user(
-            glpi,
-            group_user_existing,
-            user_id,
-            group_id,
-        )
-
         comment = (
             f"ITEM PPU: {row['ppu']} :: "
             f"PREPOSTO: {row['preposto']}"
@@ -1480,7 +1489,7 @@ def run_apply(
             "comment": comment,
             "profiles_id": profile_id,
             "entities_id": authorization_entity_id,
-            "groups_id": group_id,
+            "groups_id": 0,
         }
 
         if existed_before:
@@ -1503,6 +1512,18 @@ def run_apply(
                     f"ALTERADO login ID={user_id}: "
                     f"{old_login} -> {login}"
                 )
+
+        # Usuários da Base 4711 não devem possuir associação a Grupo GLPI.
+        for group_link in list(group_user_rows_by_user.get(user_id, [])):
+            link_id = int(group_link.get("id") or 0)
+            if link_id <= 0:
+                continue
+            glpi.purge("Group_User", link_id)
+            removed_group_links += 1
+            print(
+                f"REMOVIDO Group_User ID={link_id}: user={user_id}"
+            )
+        group_user_rows_by_user[user_id] = []
 
         if (
             normalize_compare(row["profile"])
@@ -1570,7 +1591,7 @@ def run_apply(
         print(
             f"[{pos:03}/{len(rows)}] OK "
             f"ID={user_id} login={login} "
-            f"grupo='{row['gerencia']}' "
+            f"gerencia='{row['gerencia']}' "
             f"local='{row['local']}' "
             f"status='{row['status']}' "
             f"perfil='{row['profile']}' "
@@ -1595,8 +1616,8 @@ def run_apply(
         "Autorizações antigas G4F removidas...: "
         f"{removed_root_authorizations}"
     )
+    print(f"Associações Group_User removidas.....: {removed_group_links}")
     print(f"Usuários com campos dinâmicos gravados: {updated_fields}")
-    print(f"Grupos processados...................: {len(group_ids)}")
     print(f"Gerências dropdown...................: {len(dropdown_ids['gerencia'])}")
     print(f"Locais dropdown......................: {len(dropdown_ids['local'])}")
     print(f"Status dropdown......................: {len(dropdown_ids['status'])}")
@@ -1736,6 +1757,7 @@ def main() -> int:
         users = glpi.get_all("User")
         entities = glpi.get_all("Entity")
         profile_users = glpi.get_all("Profile_User")
+        group_users = glpi.get_all("Group_User")
 
         # Valida o mapeamento ITEM PPU -> Entidade antes de qualquer gravação.
         ppu_entities = build_ppu_entity_map(rows, entities)
@@ -1756,6 +1778,7 @@ def main() -> int:
                 users,
                 entities,
                 profile_users,
+                group_users,
                 dropdown_maps,
                 container,
                 fields,
@@ -1764,13 +1787,10 @@ def main() -> int:
             )
             return 0
 
-        group_users = glpi.get_all("Group_User")
-
         run_apply(
             glpi,
             rows,
             profiles_by_name,
-            groups_map,
             users,
             entities,
             profile_users,
