@@ -8,7 +8,7 @@ O arquivo `scripts/import_base4711.py` automatiza a carga da planilha **Base_ded
 
 Principais regras implementadas:
 
-- cria/garante grupos a partir de **GERENCIA LOTACAO**;
+- usa **GERENCIA LOTACAO** somente no campo dinâmico **Gerencia Lotação**;
 - usa a mesma gerência no campo dinâmico **Gerencia Lotação**;
 - usa **LOCAL** no campo dinâmico **Localização fisica Gerencia**;
 - usa **STATUS DA MOBILIZACAO** no campo dinâmico **Status Mobilização**;
@@ -96,3 +96,14 @@ As autorizações dos usuários seguem a regra:
 - **Posto de Trabalho**: o valor de **ITEM PPU** determina a entidade. Exemplo: `3.3` é associado à entidade cujo nome inicia por `3.3 - `; o perfil é **Posto de Trabalho** e a recursividade é **Sim**.
 - Para os Postos de Trabalho já implantados, o importador remove a autorização antiga do perfil **Posto de Trabalho** diretamente na entidade raiz **G4F**, evitando acesso além do escopo do ITEM PPU.
 - A entidade da autorização também é definida como entidade padrão do usuário.
+
+
+## Regra de grupos dos usuários
+
+Os usuários importados pela Base 4711 **não devem possuir associação a Grupo GLPI**. A coluna **GERENCIA LOTACAO** é apenas informação do campo dinâmico **Gerencia Lotação**.
+
+Ao aplicar o importador:
+- vínculos existentes em `Group_User` dos usuários da Base 4711 são removidos;
+- o grupo padrão do usuário é limpo com `groups_id = 0`;
+- nenhum novo vínculo de grupo é criado;
+- os objetos de Grupo já existentes no GLPI não são excluídos, pois a correção é sobre a associação do usuário.
