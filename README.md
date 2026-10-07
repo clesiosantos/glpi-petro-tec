@@ -107,3 +107,43 @@ Ao aplicar o importador:
 - o grupo padrão do usuário é limpo com `groups_id = 0`;
 - nenhum novo vínculo de grupo é criado;
 - os objetos de Grupo já existentes no GLPI não são excluídos, pois a correção é sobre a associação do usuário.
+
+
+## Unificação das subentidades operacionais
+
+A árvore de entidades passa a utilizar uma única subentidade operacional `.1` por ITEM PPU.
+
+Exemplo:
+
+```text
+1.1 - Serviços Técnicos de Apoio às Instalações/Predial
+├── 1.1.1 - Apoio à Fiscalização e Operacional / Atividades Técnicas e Administrativas
+└── 1.1.3 - Atividade de Liderança
+```
+
+A antiga subentidade `.2` é migrada para a `.1`:
+
+- o ID da entidade `.1` é preservado;
+- a `.1` é renomeada com os dois escopos;
+- categorias ITIL associadas à antiga `.2` passam a apontar para a `.1`;
+- autorizações **Posto de Trabalho** existentes no pai do ITEM PPU ou na antiga `.2` são migradas para a `.1`, com recursividade **Sim**;
+- a entidade padrão dos profissionais é ajustada para a `.1`;
+- a antiga entidade `.2` é enviada para a lixeira;
+- a subentidade `.3` de Liderança permanece inalterada.
+
+A árvore de categorias não é fundida: seus códigos e nomes são preservados; apenas a associação de entidade da antiga `.2` é migrada para a nova `.1`.
+
+Executar primeiro:
+
+```bash
+source /root/.glpi.env
+python3 scripts/migrate_unify_operational_entities.py --dry-run
+```
+
+Somente após validar:
+
+```bash
+python3 scripts/migrate_unify_operational_entities.py --apply
+```
+
+O importador principal `import_base4711.py` também foi ajustado para associar novos Postos de Trabalho diretamente à subentidade operacional `<ITEM PPU>.1`.
