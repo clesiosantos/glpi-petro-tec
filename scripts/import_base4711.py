@@ -1751,9 +1751,6 @@ def main() -> int:
                 "PHP/local para gravar os campos do plugin Fields."
             )
 
-        groups = glpi.get_all("Group")
-        groups_map = map_existing_groups(groups)
-
         users = glpi.get_all("User")
         entities = glpi.get_all("Entity")
         profile_users = glpi.get_all("Profile_User")
@@ -1774,7 +1771,6 @@ def main() -> int:
                 rows,
                 skipped,
                 profiles_by_name,
-                groups_map,
                 users,
                 entities,
                 profile_users,
