@@ -1295,7 +1295,6 @@ def run_apply(
     glpi: GLPI,
     rows: List[Dict[str, str]],
     profiles_by_name: Dict[str, int],
-    groups_map: Dict[str, Dict[str, Any]],
     users: List[Dict[str, Any]],
     entities: List[Dict[str, Any]],
     profile_users: List[Dict[str, Any]],
