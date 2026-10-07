@@ -25,8 +25,8 @@ Regras implementadas:
       "Preposto" ao usuário GLPI correspondente pelo nome
 - Coluna G (ITEM PPU) + Coluna J (PERFIL PADRÃO):
     * perfil Preposto: autorização na entidade G4F, recursivo = Sim
-    * perfil Posto de Trabalho: autorização na entidade cujo nome inicia
-      pelo ITEM PPU (ex.: 3.3 -> "3.3 - ..."), recursivo = Sim
+    * perfil Posto de Trabalho: autorização na subentidade operacional
+      unificada .1 do ITEM PPU (ex.: 3.3 -> "3.3.1 - ..."), recursivo = Sim
     * para Posto de Trabalho, remove a autorização antiga do perfil
       Posto de Trabalho diretamente na entidade G4F
     * define perfil e entidade correspondentes como padrão do usuário
@@ -880,8 +880,8 @@ def build_ppu_entity_map(
     entities: List[Dict[str, Any]],
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Resolve ITEM PPU para a entidade de serviço de primeiro nível.
-    Exemplo: 3.3 -> "3.3 - Serviços de Engenharia Avançada ..."
+    Resolve ITEM PPU para a subentidade operacional unificada .1.
+    Exemplo: 3.3 -> "3.3.1 - ...".
     """
     ppu_codes = sorted(
         {
@@ -895,8 +895,9 @@ def build_ppu_entity_map(
     result: Dict[str, Dict[str, Any]] = {}
 
     for code in ppu_codes:
+        target_code = f"{code}.1"
         pattern = re.compile(
-            rf"^\s*{re.escape(code)}\s*[-–—]\s*",
+            rf"^\s*{re.escape(target_code)}\s*[-–—]\s*",
             flags=re.IGNORECASE,
         )
 
@@ -908,8 +909,8 @@ def build_ppu_entity_map(
 
         if len(matches) == 0:
             raise RuntimeError(
-                f"Entidade do ITEM PPU '{code}' não localizada. "
-                f"Esperado nome iniciando por '{code} - '."
+                f"Subentidade do ITEM PPU '{code}' não localizada. "
+                f"Esperado nome iniciando por '{target_code} - '."
             )
 
         if len(matches) > 1:
@@ -918,7 +919,8 @@ def build_ppu_entity_map(
                 for e in matches
             )
             raise RuntimeError(
-                f"ITEM PPU '{code}' encontrou mais de uma entidade: {names}"
+                f"ITEM PPU '{code}' encontrou mais de uma subentidade "
+                f"'{target_code}': {names}"
             )
 
         result[code] = matches[0]
@@ -1202,16 +1204,8 @@ def dry_run_report(
         "na entidade G4F | Perfil=Preposto | Recursivo=Sim"
     )
 
-    wrong_root_auth = 0
-    posto_profile_id = profiles_by_name[
-        normalize_compare("Posto de Trabalho")
-    ]
+    obsolete_authorizations = 0
     for row in rows:
-        if normalize_compare(row["profile"]) != normalize_compare(
-            "Posto de Trabalho"
-        ):
-            continue
-
         user = resolve_user_for_row(
             row,
             users_by_login,
@@ -1220,17 +1214,30 @@ def dry_run_report(
         if not user:
             continue
 
-        key = (
-            int(user["id"]),
-            int(posto_profile_id),
-            ROOT_ENTITY_ID,
-            1,
+        desired_profile_id, desired_entity_id = desired_authorization(
+            row,
+            profiles_by_name,
+            ppu_entities,
         )
-        wrong_root_auth += len(profile_user_map.get(key, []))
+
+        for auth in profile_users:
+            if int(auth.get("users_id") or 0) != int(user["id"]):
+                continue
+            if int(auth.get("profiles_id") or 0) != int(desired_profile_id):
+                continue
+
+            auth_entity = int(auth.get("entities_id") or 0)
+            auth_recursive = int(auth.get("is_recursive") or 0)
+
+            if (
+                auth_entity != int(desired_entity_id)
+                or auth_recursive != 1
+            ):
+                obsolete_authorizations += 1
 
     print(
-        "  Autorizações antigas Posto de Trabalho em G4F "
-        f"a remover.............................: {wrong_root_auth}"
+        "  Autorizações obsoletas do mesmo perfil "
+        f"a remover.............................: {obsolete_authorizations}"
     )
 
     target_user_ids = set()
@@ -1396,7 +1403,7 @@ def run_apply(
     reused_users = 0
     migrated_logins = 0
     linked_prepostos = 0
-    removed_root_authorizations = 0
+    removed_obsolete_authorizations = 0
     removed_group_links = 0
     updated_fields = 0
 
@@ -1524,29 +1531,44 @@ def run_apply(
             )
         group_user_rows_by_user[user_id] = []
 
-        if (
-            normalize_compare(row["profile"])
-            == normalize_compare("Posto de Trabalho")
-            and authorization_entity_id != ROOT_ENTITY_ID
-        ):
-            root_key = (
+        # Mantém apenas a autorização correta para o perfil da linha.
+        # Isto remove autorizações antigas no pai do ITEM PPU, em G4F ou
+        # na antiga subentidade .2 após a unificação.
+        for auth_row in profile_users:
+            if int(auth_row.get("users_id") or 0) != int(user_id):
+                continue
+            if int(auth_row.get("profiles_id") or 0) != int(profile_id):
+                continue
+
+            auth_entity_id = int(auth_row.get("entities_id") or 0)
+            auth_recursive = int(auth_row.get("is_recursive") or 0)
+
+            if (
+                auth_entity_id == int(authorization_entity_id)
+                and auth_recursive == 1
+            ):
+                continue
+
+            auth_id = int(auth_row.get("id") or 0)
+            if auth_id <= 0:
+                continue
+
+            glpi.purge("Profile_User", auth_id)
+            removed_obsolete_authorizations += 1
+            print(
+                f"REMOVIDA autorização obsoleta Profile_User ID={auth_id}: "
+                f"user={user_id} perfil={profile_id} "
+                f"entidade={auth_entity_id} recursivo={auth_recursive}"
+            )
+
+            old_key = (
                 int(user_id),
                 int(profile_id),
-                ROOT_ENTITY_ID,
-                1,
+                auth_entity_id,
+                auth_recursive,
             )
-            for auth_row in list(profile_user_map.get(root_key, [])):
-                auth_id = int(auth_row.get("id") or 0)
-                if auth_id <= 0:
-                    continue
-                glpi.purge("Profile_User", auth_id)
-                removed_root_authorizations += 1
-                print(
-                    f"REMOVIDA autorização antiga Profile_User ID={auth_id}: "
-                    f"user={user_id} perfil={profile_id} entidade=G4F"
-                )
-            profile_user_map[root_key] = []
-            profile_user_existing.discard(root_key)
+            profile_user_map[old_key] = []
+            profile_user_existing.discard(old_key)
 
         plugin_payload = {
             "items_id": user_id,
@@ -1612,8 +1634,8 @@ def run_apply(
     print(f"Logins migrados para Matrícula Senior: {migrated_logins}")
     print(f"Postos vinculados ao Preposto........: {linked_prepostos}")
     print(
-        "Autorizações antigas G4F removidas...: "
-        f"{removed_root_authorizations}"
+        "Autorizações obsoletas removidas.....: "
+        f"{removed_obsolete_authorizations}"
     )
     print(f"Associações Group_User removidas.....: {removed_group_links}")
     print(f"Usuários com campos dinâmicos gravados: {updated_fields}")
@@ -1758,7 +1780,7 @@ def main() -> int:
         # Valida o mapeamento ITEM PPU -> Entidade antes de qualquer gravação.
         ppu_entities = build_ppu_entity_map(rows, entities)
         print(
-            "OK - ITEM PPU mapeado para entidade: "
+            "OK - ITEM PPU mapeado para subentidade operacional: "
             + ", ".join(
                 f"{code}=ID {ppu_entities[code]['id']}"
                 for code in sorted(ppu_entities)
