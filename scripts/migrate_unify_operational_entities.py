@@ -74,18 +74,33 @@ def find_single_entity(
     parent_id: Optional[int] = None,
     required: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    matches = [
+    code_matches = [
         e
         for e in entities
         if entity_code(clean_text(e.get("name"))) == code
-        and (
-            parent_id is None
-            or entity_parent_id(e) == int(parent_id)
-        )
     ]
+
+    if parent_id is not None:
+        matches = [
+            e
+            for e in code_matches
+            if entity_parent_id(e) == int(parent_id)
+        ]
+    else:
+        matches = code_matches
 
     if len(matches) == 1:
         return matches[0]
+
+    # Pós-migração: em alguns retornos da API o parent pode não vir
+    # materializado como antes. Se o código for único globalmente,
+    # usamos o item único e exibimos o parent real no relatório.
+    if (
+        parent_id is not None
+        and len(matches) == 0
+        and len(code_matches) == 1
+    ):
+        return code_matches[0]
 
     if len(matches) == 0 and not required:
         return None
@@ -249,7 +264,7 @@ def print_plan(plan: List[Dict[str, Any]]) -> None:
                 f"ID={source.get('id')} {source.get('name')}"
             )
         else:
-            source_text = "já removida / não localizada"
+            source_text = "JÁ MIGRADA / .2 não ativa"
 
         print()
         print(
@@ -286,6 +301,13 @@ def print_plan(plan: List[Dict[str, Any]]) -> None:
     print(f"Categorias a migrar...................: {total_categories}")
     print(f"Autorizações a migrar.................: {total_auth}")
     print(f"Usuários padrão a ajustar.............: {total_users}")
+    if (
+        total_sources == 0
+        and total_categories == 0
+        and total_auth == 0
+        and total_users == 0
+    ):
+        print("Status.................................: MIGRAÇÃO JÁ CONCLUÍDA")
     print("=" * 112)
 
 
