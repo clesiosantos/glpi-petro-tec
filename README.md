@@ -147,3 +147,42 @@ python3 scripts/migrate_unify_operational_entities.py --apply
 ```
 
 O importador principal `import_base4711.py` também foi ajustado para associar novos Postos de Trabalho diretamente à subentidade operacional `<ITEM PPU>.1`.
+
+
+## Hierarquia final das entidades
+
+Todas as entidades da Base 4711 devem seguir obrigatoriamente a estrutura:
+
+```text
+G4F
+├── 1.1 - Serviço
+│   ├── 1.1.1 - Operacional unificada
+│   └── 1.1.3 - Atividade de Liderança
+├── 1.2 - Serviço
+│   ├── 1.2.1 - Operacional unificada
+│   └── 1.2.3 - Atividade de Liderança
+...
+└── 6.1 - Serviço
+    ├── 6.1.1 - Operacional unificada
+    └── 6.1.3 - Atividade de Liderança
+```
+
+Regras:
+
+- **G4F** é a entidade raiz;
+- cada entidade de serviço `X.Y` é filha direta de G4F;
+- a entidade operacional `X.Y.1` é filha direta do seu serviço `X.Y`;
+- a entidade `X.Y.3` de Liderança é filha direta do mesmo serviço;
+- as antigas entidades `X.Y.2` permanecem na lixeira e não são recriadas.
+
+Para validar:
+
+```bash
+python3 scripts/fix_entity_hierarchy.py --dry-run
+```
+
+Para corrigir:
+
+```bash
+python3 scripts/fix_entity_hierarchy.py --apply
+```
